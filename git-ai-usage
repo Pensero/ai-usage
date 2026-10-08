@@ -1,0 +1,671 @@
+#!/usr/bin/env python3
+"""git ai-usage: record local AI coding-agent usage per commit in git notes.
+
+Reads the Claude Code transcripts on this machine (~/.claude/projects/**/*.jsonl) and writes,
+for each of your commits, the tokens and the derived cost of the work done in the repository
+since your previous commit. The data goes to the notes ref refs/notes/ai-usage, so commit SHAs
+do not change and past commits can be backfilled.
+
+A commit gets the usage between your previous commit and its author date, from transcripts
+whose working directory is inside the repository (or one of its worktrees). Each usage record
+belongs to exactly one window, so no record is counted twice.
+
+Note format, one line per model (plus one line for edited lines):
+
+    claude-code model=claude-opus-4-1 in=1200 out=5400 cache_read=230000 cache_write=12000 cost_usd=1.8400 from=1791000000 to=1791003600
+    claude-code added=120 deleted=14 from=1791000000 to=1791003600
+
+Readers sum the numeric keys of the unique lines. The window (from, to) makes a line unique, so
+a note copied twice by an amend is counted once and a squash keeps the lines of both commits.
+"""
+
+from __future__ import annotations
+
+import argparse
+import bisect
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+__version__ = "0.1.0"
+
+NOTES_REF = "refs/notes/ai-usage"
+REMOTE_COPY_REF = "refs/notes/ai-usage-remote"
+TOOL = "claude-code"
+TOKEN_KEYS = ("in", "out", "cache_read", "cache_write")
+EDIT_KEYS = ("added", "deleted")
+# Not --all: the commits of refs/notes/* and refs/stash are yours too, and their times would
+# split the windows.
+CODE_REFS = ("--branches", "--tags", "--remotes", "HEAD")
+HOOK_START = "# >>> git-ai-usage >>>"
+HOOK_END = "# <<< git-ai-usage <<<"
+
+# USD per 1,000,000 tokens, from the model catalog in the Claude Code binary. This is the
+# API-equivalent cost: a subscription plan pays a flat fee instead.
+PRICING_TIERS = {
+    "tier_3_15": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_write_1h": 6.0, "cache_read": 0.3},
+    "tier_5_25": {"input": 5.0, "output": 25.0, "cache_write": 6.25, "cache_write_1h": 10.0, "cache_read": 0.5},
+    "tier_10_50": {"input": 10.0, "output": 50.0, "cache_write": 12.5, "cache_write_1h": 20.0, "cache_read": 1.0},
+    "tier_15_75": {"input": 15.0, "output": 75.0, "cache_write": 18.75, "cache_write_1h": 30.0, "cache_read": 1.5},
+    "fast_30_150": {"input": 30.0, "output": 150.0, "cache_write": 37.5, "cache_write_1h": 60.0, "cache_read": 3.0},
+    "haiku_35": {"input": 0.8, "output": 4.0, "cache_write": 1.0, "cache_write_1h": 1.6, "cache_read": 0.08},
+    "haiku_45": {"input": 1.0, "output": 5.0, "cache_write": 1.25, "cache_write_1h": 2.0, "cache_read": 0.1},
+}
+WEB_SEARCH_USD = 0.01
+FAST_MODE_TIERS = {
+    "claude-opus-5": "tier_10_50",
+    "claude-opus-4-8": "tier_10_50",
+    "claude-opus-4-7": "fast_30_150",
+    "claude-opus-4-6": "fast_30_150",
+}
+MODEL_TIERS = {
+    "claude-opus-5": "tier_5_25",
+    "claude-opus-4-8": "tier_5_25",
+    "claude-opus-4-7": "tier_5_25",
+    "claude-opus-4-6": "tier_5_25",
+    "claude-opus-4-5": "tier_5_25",
+    "claude-opus-4-1": "tier_15_75",
+    "claude-opus-4-0": "tier_15_75",
+    "claude-opus-4-20250514": "tier_15_75",
+    "claude-sonnet-4-20250514": "tier_3_15",
+    "claude-sonnet-5": "tier_3_15",
+    "claude-sonnet-4-6": "tier_3_15",
+    "claude-sonnet-4-5": "tier_3_15",
+    "claude-sonnet-4-0": "tier_3_15",
+    "claude-3-7-sonnet": "tier_3_15",
+    "claude-3-5-sonnet": "tier_3_15",
+    "claude-haiku-4-5": "haiku_45",
+    "claude-3-5-haiku": "haiku_35",
+    "claude-fable-5": "tier_10_50",
+    "claude-mythos-5": "tier_10_50",
+}
+
+
+class UsageError(RuntimeError):
+    """A problem the user can fix, shown without a traceback."""
+
+
+# --- git ----------------------------------------------------------------------
+
+
+def git(*args: str, check: bool = True, stdin: str | None = None) -> str:
+    """Run git and return its stdout. The output is not stripped: callers use control-character
+    separators, and str.strip() removes them as whitespace."""
+    result = subprocess.run(
+        ["git", *args],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if check and result.returncode != 0:
+        raise UsageError(f"git {' '.join(args)}: {result.stderr.strip()}")
+    return result.stdout
+
+
+def git_ok(*args: str) -> bool:
+    return subprocess.run(["git", *args], capture_output=True).returncode == 0
+
+
+def repo_roots() -> list[str]:
+    """The paths of all worktrees of this repository."""
+    roots = [line[len("worktree ") :] for line in git("worktree", "list", "--porcelain").splitlines() if line.startswith("worktree ")]
+    if not roots:
+        roots = [git("rev-parse", "--show-toplevel").rstrip("\n")]
+    return [os.path.realpath(root) for root in roots]
+
+
+def user_email() -> str:
+    email = git("config", "user.email", check=False).rstrip("\n")
+    if not email:
+        raise UsageError("git config user.email is not set")
+    return email
+
+
+@dataclass(frozen=True)
+class Commit:
+    sha: str
+    author_time: int
+    email: str
+    subject: str
+
+
+def list_commits(*rev_args: str) -> list[Commit]:
+    output = git("log", "--no-merges", "--format=%H%x1f%at%x1f%ae%x1f%s%x1e", *rev_args)
+    commits = []
+    for record in output.split("\x1e"):
+        record = record.lstrip("\n")
+        if not record:
+            continue
+        sha, author_time, email, subject = record.split("\x1f", 3)
+        commits.append(Commit(sha, int(author_time), email, subject))
+    return commits
+
+
+def own_commit_times(email: str) -> list[int]:
+    """Sorted unique author times of your commits. They are the window bounds."""
+    return sorted({commit.author_time for commit in list_commits(*CODE_REFS) if commit.email.lower() == email.lower()})
+
+
+def read_note(sha: str) -> str:
+    return git("notes", f"--ref={NOTES_REF}", "show", sha, check=False)
+
+
+def notes_by_commit(rev_args: list[str]) -> list[tuple[Commit, str]]:
+    output = git(
+        "log", "--no-merges", "--no-notes", f"--notes={NOTES_REF}",
+        "--format=%H%x1f%at%x1f%ae%x1f%s%x1f%N%x1e", *rev_args,
+    )
+    result = []
+    for record in output.split("\x1e"):
+        record = record.lstrip("\n")
+        if not record:
+            continue
+        sha, author_time, email, subject, note = record.split("\x1f", 4)
+        result.append((Commit(sha, int(author_time), email, subject), note))
+    return result
+
+
+def write_note(sha: str, text: str) -> None:
+    git("notes", f"--ref={NOTES_REF}", "add", "-f", "-F", "-", sha, stdin=text)
+
+
+# --- transcripts --------------------------------------------------------------
+
+
+def claude_projects_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+
+
+def encode_project(path: str) -> str:
+    """Claude Code names a project folder after its working directory, with every
+    non-alphanumeric character replaced by '-'."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def project_dirs(roots: list[str]) -> list[Path]:
+    base = claude_projects_dir()
+    if not base.is_dir():
+        return []
+    dirs = [entry for entry in base.iterdir() if entry.is_dir()]
+    prefixes = [encode_project(root) for root in roots]
+    matched = [entry for entry in dirs if any(entry.name == p or entry.name.startswith(p + "-") for p in prefixes)]
+    # The folder name is a hint only; if it does not match, the cwd of each record still decides.
+    return matched or dirs
+
+
+def inside(cwd: str, roots: list[str]) -> bool:
+    if not cwd:
+        return False
+    path = os.path.realpath(cwd)
+    return any(path == root or path.startswith(root.rstrip("/") + "/") for root in roots)
+
+
+def parse_time(value: str) -> float:
+    # Python before 3.11 does not accept a "Z" suffix.
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc).timestamp()
+
+
+@dataclass
+class Call:
+    """One assistant API call, deduplicated by message id."""
+
+    when: float
+    model: str
+    fast: bool
+    tokens: dict
+
+
+@dataclass
+class Edit:
+    when: float
+    added: int
+    deleted: int
+
+
+def edited_lines(result: dict) -> tuple[int, int]:
+    added = deleted = 0
+    for hunk in result.get("structuredPatch") or []:
+        for line in hunk.get("lines", []):
+            added += line.startswith("+")
+            deleted += line.startswith("-")
+    if result.get("type") == "create":
+        added += len((result.get("content") or "").split("\n"))
+    return added, deleted
+
+
+def read_transcripts(roots: list[str], since: float | None = None) -> tuple[list[Call], list[Edit]]:
+    """All usage recorded in the repository, from transcripts changed after `since`.
+
+    Claude Code writes one line per content block, and an early line can carry a partial output
+    count, so a message keeps the largest value seen for each field. Resumed sessions copy old
+    records into a new file: the message id and the record uuid remove those copies.
+    """
+    calls: dict[str, Call] = {}
+    edits: dict[str, Edit] = {}
+    for folder in project_dirs(roots):
+        for path in folder.rglob("*.jsonl"):
+            try:
+                if since is not None and path.stat().st_mtime < since:
+                    continue
+                handle = path.open(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            with handle:
+                for line in handle:
+                    if '"assistant"' not in line and '"toolUseResult"' not in line:
+                        continue
+                    try:
+                        _read_record(json.loads(line), roots, calls, edits)
+                    except (ValueError, KeyError, TypeError, AttributeError):
+                        # An open session has a half-written last line.
+                        continue
+    return list(calls.values()), list(edits.values())
+
+
+def _read_record(record: dict, roots: list[str], calls: dict, edits: dict) -> None:
+    if not record.get("timestamp") or not inside(record.get("cwd", ""), roots):
+        return
+    when = parse_time(record["timestamp"])
+    if record.get("type") == "assistant":
+        message = record["message"]
+        usage = message.get("usage") or {}
+        if not usage:
+            return
+        tokens = {
+            "in": usage.get("input_tokens", 0) or 0,
+            "out": usage.get("output_tokens", 0) or 0,
+            "cache_write": usage.get("cache_creation_input_tokens", 0) or 0,
+            "cache_read": usage.get("cache_read_input_tokens", 0) or 0,
+            "cache_write_1h": (usage.get("cache_creation") or {}).get("ephemeral_1h_input_tokens", 0) or 0,
+            "web_search": (usage.get("server_tool_use") or {}).get("web_search_requests", 0) or 0,
+        }
+        key = message.get("id") or record.get("uuid")
+        previous = calls.get(key)
+        if previous:
+            previous.tokens = {name: max(value, previous.tokens[name]) for name, value in tokens.items()}
+            return
+        calls[key] = Call(when, message.get("model", ""), usage.get("speed") == "fast", tokens)
+        return
+    result = record.get("toolUseResult")
+    if isinstance(result, dict) and record.get("uuid"):
+        added, deleted = edited_lines(result)
+        if added or deleted:
+            edits[record["uuid"]] = Edit(when, added, deleted)
+
+
+def rates_for(model: str, fast: bool = False) -> dict | None:
+    for table in ((FAST_MODE_TIERS if fast else {}), MODEL_TIERS):
+        if model in table:
+            return PRICING_TIERS[table[model]]
+        for key in sorted(table, key=len, reverse=True):
+            if key in model:
+                return PRICING_TIERS[table[key]]
+    return None
+
+
+def cost_usd(call: Call) -> float:
+    rates = rates_for(call.model, call.fast)
+    if not rates:
+        return 0.0
+    tokens = call.tokens
+    written = tokens["cache_write"]
+    one_hour = min(tokens["cache_write_1h"], written)
+    per_million = one_hour * rates["cache_write_1h"] + (written - one_hour) * rates["cache_write"]
+    per_million += tokens["in"] * rates["input"] + tokens["out"] * rates["output"] + tokens["cache_read"] * rates["cache_read"]
+    return per_million / 1_000_000 + tokens["web_search"] * WEB_SEARCH_USD
+
+
+# --- windows and notes ----------------------------------------------------------
+
+
+def window_of(author_time: int, bounds: list[int]) -> tuple[int, int]:
+    """(previous own commit time, this commit time]. The first commit starts at 0."""
+    index = bisect.bisect_left(bounds, author_time)
+    start = bounds[index - 1] if index > 0 else 0
+    return start, author_time
+
+
+def note_for_window(start: int, end: int, calls: list[Call], edits: list[Edit]) -> str:
+    per_model: dict[str, dict] = defaultdict(lambda: {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0})
+    for call in calls:
+        if start < call.when <= end:
+            total = per_model[call.model or "unknown"]
+            for key in TOKEN_KEYS:
+                total[key] += call.tokens[key]
+            total["cost"] += cost_usd(call)
+    added = sum(edit.added for edit in edits if start < edit.when <= end)
+    deleted = sum(edit.deleted for edit in edits if start < edit.when <= end)
+    lines = []
+    span = f"from={start} to={end}"
+    for model in sorted(per_model):
+        total = per_model[model]
+        if not any(total[key] for key in TOKEN_KEYS):
+            continue
+        counts = " ".join(f"{key}={total[key]}" for key in TOKEN_KEYS)
+        lines.append(f"{TOOL} model={model} {counts} cost_usd={total['cost']:.4f} {span}")
+    if added or deleted:
+        lines.append(f"{TOOL} added={added} deleted={deleted} {span}")
+    return "".join(line + "\n" for line in lines)
+
+
+def parse_note(text: str) -> list[dict]:
+    entries = []
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts or parts[0] != TOOL:
+            continue
+        entry = {"_line": line.strip()}
+        for part in parts[1:]:
+            key, _, value = part.partition("=")
+            entry[key] = value
+        entries.append(entry)
+    return entries
+
+
+@dataclass
+class Totals:
+    tokens: dict = field(default_factory=lambda: dict.fromkeys(TOKEN_KEYS, 0))
+    cost: float = 0.0
+    added: int = 0
+    deleted: int = 0
+
+    def add(self, entry: dict) -> None:
+        for key in TOKEN_KEYS:
+            self.tokens[key] += int(entry.get(key, 0) or 0)
+        self.cost += float(entry.get("cost_usd", 0) or 0)
+        self.added += int(entry.get("added", 0) or 0)
+        self.deleted += int(entry.get("deleted", 0) or 0)
+
+
+def summarize(notes: list[tuple[Commit, str]]) -> tuple[list[tuple[Commit, Totals]], dict[str, Totals], Totals]:
+    """Per-commit and per-model totals. A line seen on two commits (a cherry-pick or a rebased
+    copy) counts once."""
+    seen: set[str] = set()
+    per_commit = []
+    per_model: dict[str, Totals] = defaultdict(Totals)
+    grand = Totals()
+    for commit, note in notes:
+        commit_total = Totals()
+        for entry in parse_note(note):
+            if entry["_line"] in seen:
+                continue
+            seen.add(entry["_line"])
+            commit_total.add(entry)
+            grand.add(entry)
+            if "model" in entry:
+                per_model[entry["model"]].add(entry)
+        per_commit.append((commit, commit_total))
+    return per_commit, dict(per_model), grand
+
+
+# --- commands -------------------------------------------------------------------
+
+
+def in_rebase() -> bool:
+    return any(os.path.exists(git("rev-parse", "--git-path", name).rstrip("\n")) for name in ("rebase-merge", "rebase-apply"))
+
+
+def backfill(email: str, force: bool = False, extra_paths: list[str] | None = None, quiet: bool = False) -> int:
+    """Write notes for your commits that have none. Returns the number of notes written."""
+    roots = repo_roots() + [os.path.realpath(path) for path in extra_paths or []]
+    bounds = own_commit_times(email)
+    if not bounds:
+        return 0
+    calls, edits = read_transcripts(roots)
+    if not calls and not edits:
+        return 0
+    first_usage = min(item.when for item in [*calls, *edits])
+    written = 0
+    for commit in list_commits(*CODE_REFS):
+        if commit.email.lower() != email.lower() or commit.author_time < first_usage:
+            continue
+        if not force and read_note(commit.sha):
+            continue
+        start, end = window_of(commit.author_time, bounds)
+        text = note_for_window(start, end, calls, edits)
+        if text:
+            write_note(commit.sha, text)
+            written += 1
+            if not quiet:
+                print(f"{commit.sha[:10]} {commit.subject[:60]}")
+    return written
+
+
+def note_head() -> None:
+    """post-commit hook: write the note for HEAD. Never fails the commit."""
+    if in_rebase() or read_note("HEAD"):
+        return
+    head = list_commits("-1", "HEAD")
+    if not head:
+        return
+    commit = head[0]
+    email = user_email()
+    if commit.email.lower() != email.lower():
+        return
+    bounds = own_commit_times(email)
+    start, end = window_of(commit.author_time, bounds)
+    calls, edits = read_transcripts(repo_roots(), since=start or None)
+    text = note_for_window(start, end, calls, edits)
+    if text:
+        write_note(commit.sha, text)
+
+
+def default_base() -> str | None:
+    head = git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False).strip()
+    candidates = [head] if head else []
+    candidates += ["origin/main", "origin/master", "main", "master"]
+    for candidate in candidates:
+        if git_ok("rev-parse", "--verify", "--quiet", candidate):
+            return candidate
+    return None
+
+
+def format_tokens(value: int) -> str:
+    for unit, size in (("M", 1_000_000), ("k", 1_000)):
+        if value >= size:
+            return f"{value / size:.1f}{unit}"
+    return str(value)
+
+
+def show(revision: str | None, as_json: bool) -> None:
+    if revision is None:
+        base = default_base()
+        head_is_base = base is not None and git("rev-parse", base) == git("rev-parse", "HEAD")
+        revision = f"{base}..HEAD" if base and not head_is_base else "HEAD"
+    rev_args = [revision] if ".." in revision else ["-1", revision]
+    per_commit, per_model, grand = summarize(notes_by_commit(rev_args))
+    if as_json:
+        print(json.dumps({
+            "range": revision,
+            "commits": [
+                {"sha": c.sha, "subject": c.subject, **t.tokens, "cost_usd": round(t.cost, 4), "added": t.added, "deleted": t.deleted}
+                for c, t in per_commit
+            ],
+            "models": {m: {**t.tokens, "cost_usd": round(t.cost, 4)} for m, t in per_model.items()},
+            "total": {**grand.tokens, "cost_usd": round(grand.cost, 4), "added": grand.added, "deleted": grand.deleted},
+        }, indent=2))
+        return
+    header = f"{'commit':10}  {'in':>7} {'out':>7} {'c.read':>7} {'c.write':>7} {'cost $':>8} {'+lines':>7} {'-lines':>7}  subject"
+    print(f"AI usage for {revision}\n")
+    print(header)
+    for commit, total in per_commit:
+        t = total.tokens
+        print(
+            f"{commit.sha[:10]}  {format_tokens(t['in']):>7} {format_tokens(t['out']):>7} {format_tokens(t['cache_read']):>7} "
+            f"{format_tokens(t['cache_write']):>7} {total.cost:>8.2f} {total.added:>7} {total.deleted:>7}  {commit.subject[:50]}"
+        )
+    t = grand.tokens
+    print(
+        f"{'total':10}  {format_tokens(t['in']):>7} {format_tokens(t['out']):>7} {format_tokens(t['cache_read']):>7} "
+        f"{format_tokens(t['cache_write']):>7} {grand.cost:>8.2f} {grand.added:>7} {grand.deleted:>7}"
+    )
+    if per_model:
+        print("\nby model:")
+        for model, total in sorted(per_model.items(), key=lambda item: -item[1].cost):
+            print(f"  {model:40} {total.cost:>8.2f} $  out={format_tokens(total.tokens['out'])}")
+
+
+def hook_block(name: str) -> str:
+    script = os.path.realpath(__file__)
+    args = ' "$1"' if name == "pre-push" else ""
+    return (
+        f"{HOOK_START}\n"
+        f"[ -x '{script}' ] && '{script}' hook {name}{args} </dev/null >/dev/null 2>&1 || true\n"
+        f"{HOOK_END}\n"
+    )
+
+
+def install_hook(hooks_dir: Path, name: str) -> None:
+    path = hooks_dir / name
+    block = hook_block(name)
+    if path.exists():
+        content = path.read_text()
+        if HOOK_START in content:
+            content = re.sub(re.escape(HOOK_START) + r".*?" + re.escape(HOOK_END) + r"\n?", block, content, flags=re.S)
+        else:
+            # Run before the existing hook body: a hook that ends with `exit` would skip an
+            # appended block. Stdin is closed for our call so the existing hook still gets it.
+            first, sep, rest = content.partition("\n")
+            content = f"{first}\n{block}{rest}" if first.startswith("#!") else f"#!/bin/sh\n{block}{content}"
+    else:
+        content = f"#!/bin/sh\n{block}"
+    path.write_text(content)
+    path.chmod(path.stat().st_mode | 0o111)
+
+
+def add_config(key: str, value: str) -> None:
+    if value not in git("config", "--get-all", key, check=False).splitlines():
+        git("config", "--add", key, value)
+
+
+def install() -> None:
+    hooks_dir = Path(git("rev-parse", "--git-path", "hooks").rstrip("\n"))
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    install_hook(hooks_dir, "post-commit")
+    install_hook(hooks_dir, "pre-push")
+    # Notes follow commits through amend and rebase, and git log shows them.
+    add_config("notes.rewriteRef", NOTES_REF)
+    add_config("notes.displayRef", NOTES_REF)
+    print(f"Installed post-commit and pre-push hooks in {hooks_dir}")
+
+
+def uninstall() -> None:
+    hooks_dir = Path(git("rev-parse", "--git-path", "hooks").rstrip("\n"))
+    for name in ("post-commit", "pre-push"):
+        path = hooks_dir / name
+        if path.exists() and HOOK_START in path.read_text():
+            content = re.sub(re.escape(HOOK_START) + r".*?" + re.escape(HOOK_END) + r"\n?", "", path.read_text(), flags=re.S)
+            if content.strip() in ("", "#!/bin/sh"):
+                path.unlink()
+            else:
+                path.write_text(content)
+    for key in ("notes.rewriteRef", "notes.displayRef"):
+        git("config", "--unset", key, re.escape(NOTES_REF), check=False)
+    print("Removed the hooks. Existing notes stay in refs/notes/ai-usage.")
+
+
+def fetch(remote: str) -> None:
+    """Merge the remote notes into the local ones, so a push is a fast-forward."""
+    if not git_ok("fetch", "--quiet", remote, f"+{NOTES_REF}:{REMOTE_COPY_REF}"):
+        return
+    if not git_ok("rev-parse", "--verify", "--quiet", NOTES_REF):
+        git("update-ref", NOTES_REF, REMOTE_COPY_REF)
+        return
+    git("notes", f"--ref={NOTES_REF}", "merge", "--quiet", "-s", "cat_sort_uniq", REMOTE_COPY_REF)
+
+
+def push(remote: str) -> None:
+    if not git_ok("rev-parse", "--verify", "--quiet", NOTES_REF):
+        return
+    fetch(remote)
+    git("push", "--quiet", "--no-verify", remote, NOTES_REF)
+
+
+def ask(question: str, default: bool = True) -> bool:
+    try:
+        with open("/dev/tty") as tty:
+            sys.stdout.write(f"{question} [{'Y/n' if default else 'y/N'}] ")
+            sys.stdout.flush()
+            answer = tty.readline().strip().lower()
+    except OSError:
+        return default
+    return default if not answer else answer.startswith("y")
+
+
+def setup() -> None:
+    install()
+    email = user_email()
+    if ask(f"Backfill notes for your past commits ({email}) from the local Claude Code transcripts?"):
+        written = backfill(email)
+        print(f"Wrote {written} note{'' if written == 1 else 's'}.")
+    remote = "origin" if git_ok("remote", "get-url", "origin") else None
+    if remote and git_ok("rev-parse", "--verify", "--quiet", NOTES_REF):
+        if ask(f"Push the notes to {remote} now? (later pushes send them automatically)", default=False):
+            push(remote)
+            print(f"Pushed {NOTES_REF} to {remote}.")
+    print("\nSee the usage of this branch with: git ai-usage show")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="git ai-usage", description="Record local AI coding-agent usage per commit in git notes.")
+    parser.add_argument("--version", action="version", version=__version__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("setup", help="install the hooks, then offer to backfill and push")
+    commands.add_parser("install", help="install the post-commit and pre-push hooks in this repository")
+    commands.add_parser("uninstall", help="remove the hooks (the notes stay)")
+    backfill_parser = commands.add_parser("backfill", help="write notes for your past commits")
+    backfill_parser.add_argument("--author", help="author email (default: git config user.email)")
+    backfill_parser.add_argument("--force", action="store_true", help="also rewrite commits that already have a note")
+    backfill_parser.add_argument("--path", action="append", default=[], help="an earlier path of this repository (repeatable)")
+    show_parser = commands.add_parser("show", help="usage of a commit or a range (default: this branch)")
+    show_parser.add_argument("revision", nargs="?", help="a commit or a range such as main..HEAD")
+    show_parser.add_argument("--json", action="store_true")
+    for name in ("push", "fetch"):
+        sub = commands.add_parser(name, help=f"{name} {NOTES_REF}")
+        sub.add_argument("remote", nargs="?", default="origin")
+    hook_parser = commands.add_parser("hook", help=argparse.SUPPRESS)
+    hook_parser.add_argument("name", choices=("post-commit", "pre-push"))
+    hook_parser.add_argument("remote", nargs="?", default="origin")
+    args = parser.parse_args(argv)
+
+    try:
+        if args.command == "hook":
+            try:
+                if args.name == "post-commit":
+                    note_head()
+                else:
+                    push(args.remote)
+            except Exception:  # noqa: BLE001 - a hook must never block a commit or a push
+                pass
+            return 0
+        if args.command == "setup":
+            setup()
+        elif args.command == "install":
+            install()
+        elif args.command == "uninstall":
+            uninstall()
+        elif args.command == "backfill":
+            written = backfill(args.author or user_email(), force=args.force, extra_paths=args.path)
+            print(f"Wrote {written} note{'' if written == 1 else 's'}.")
+        elif args.command == "show":
+            show(args.revision, args.json)
+        elif args.command == "push":
+            push(args.remote)
+        elif args.command == "fetch":
+            fetch(args.remote)
+    except UsageError as error:
+        print(f"git ai-usage: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
