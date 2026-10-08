@@ -8,6 +8,12 @@ needs no account, no telemetry and no server.
 curl -fsSL https://raw.githubusercontent.com/Pensero/ai-usage/main/install.sh | sh
 ```
 
+While the repository is private, raw GitHub URLs need authentication. Install from a clone:
+
+```sh
+git clone https://github.com/Pensero/ai-usage ~/.ai-usage && ~/.ai-usage/install.sh
+```
+
 Run it inside a repository. It installs the hooks, asks to backfill your past commits, and asks
 to push the notes.
 

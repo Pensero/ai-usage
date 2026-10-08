@@ -1,5 +1,6 @@
 #!/bin/sh
 # Install git-ai-usage: curl -fsSL https://raw.githubusercontent.com/Pensero/ai-usage/main/install.sh | sh
+# or, from a clone of this repository: ./install.sh
 # Run it inside a repository to also install the hooks there and backfill your past commits.
 set -eu
 
@@ -16,7 +17,13 @@ if ! command -v git >/dev/null 2>&1; then
 fi
 
 mkdir -p "$BIN_DIR"
-curl -fsSL "$SOURCE" -o "$BIN_DIR/git-ai-usage.tmp"
+# From a clone, use the script next to this file. Under `curl | sh`, $0 is the shell, so download.
+LOCAL="$(dirname "$0")/git-ai-usage"
+if [ -z "${GIT_AI_USAGE_SOURCE:-}" ] && [ -f "$LOCAL" ]; then
+  cp "$LOCAL" "$BIN_DIR/git-ai-usage.tmp"
+else
+  curl -fsSL "$SOURCE" -o "$BIN_DIR/git-ai-usage.tmp"
+fi
 chmod +x "$BIN_DIR/git-ai-usage.tmp"
 mv "$BIN_DIR/git-ai-usage.tmp" "$BIN_DIR/git-ai-usage"
 echo "Installed $BIN_DIR/git-ai-usage"
