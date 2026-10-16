@@ -109,8 +109,8 @@ class Sandbox(unittest.TestCase):
         with path.open("a") as handle:
             handle.write(json.dumps({"timestamp": iso(when), "type": kind, "payload": payload}) + "\n")
 
-    def response(self, path: Path, when: float, response_id: str, input=1000, cached=0, out=100):
-        usage = {"input_tokens": input, "cached_input_tokens": cached, "cache_write_input_tokens": 0,
+    def response(self, path: Path, when: float, response_id: str, input=1000, cached=0, out=100, written=0):
+        usage = {"input_tokens": input, "cached_input_tokens": cached, "cache_write_input_tokens": written,
                  "output_tokens": out, "reasoning_output_tokens": 0, "total_tokens": input + out}
         self.codex_line(path, when, "token_usage_record", {"response_id": response_id, "usage": usage})
 
@@ -262,6 +262,22 @@ class CodexTest(Sandbox):
         # gpt-5.6-sol: $4 input and $20 output per 1M up to 272K input, $8 and $30 above.
         self.assertAlmostEqual(float(self.codex_note(short)["gpt-5.6-sol"]["cost_usd"]), 2 * (0.8 + 0.02), places=4)
         self.assertAlmostEqual(float(self.codex_note(long)["gpt-5.6-sol"]["cost_usd"]), 2.4 + 0.03, places=4)
+
+    def test_input_includes_the_cached_and_cache_write_tokens(self):
+        path = self.rollout("t1")
+        self.commit(1)
+        self.response(path, T0 + 1100, "r1", input=10_000, cached=3000, written=2000, out=1000)
+        short = self.commit(2)
+        # 300K input, of which only 100K is not cached: the request is still above 272K.
+        self.response(path, T0 + 2100, "r2", input=300_000, cached=200_000, out=1000)
+        long = self.commit(3)
+        tool.backfill(EMAIL, quiet=True)
+        line = self.codex_note(short)["gpt-5.6-sol"]
+        self.assertEqual((line["in"], line["cache_read"], line["cache_write"]), ("5000", "3000", "2000"))
+        # gpt-5.6-sol up to 272K: $4 input, $0.40 cached, $5 cache write and $20 output per 1M.
+        self.assertAlmostEqual(float(line["cost_usd"]), 0.02 + 0.0012 + 0.01 + 0.02, places=4)
+        # Above 272K: $8 input, $0.80 cached and $30 output per 1M.
+        self.assertAlmostEqual(float(self.codex_note(long)["gpt-5.6-sol"]["cost_usd"]), 0.8 + 0.16 + 0.03, places=4)
 
     def test_cost_uses_the_processing_mode(self):
         path = self.rollout("t1")
