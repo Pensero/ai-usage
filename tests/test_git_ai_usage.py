@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +45,8 @@ class Sandbox(unittest.TestCase):
             "GIT_CONFIG_NOSYSTEM": "1",
             "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
             "CODEX_HOME": str(self.home / ".codex"),
+            "GIT_AI_USAGE_OFFLINE": "1",
+            "XDG_CACHE_HOME": str(self.tmp / "cache"),
         })
         self.repo = self.tmp / "repo"
         self.repo.mkdir()
@@ -460,6 +465,124 @@ class RemoteTest(Sandbox):
         self.git("fetch", "-q", "origin", "main")
         tool.fetch("origin")
         self.assertEqual(tool.parse_note(tool.read_note(here))[0]["out"], "10")
+
+
+class PriceSourceTest(Sandbox):
+    def setUp(self):
+        super().setUp()
+        del os.environ["GIT_AI_USAGE_OFFLINE"]
+        self.litellm = self.tmp / "litellm.json"
+        self.models_dev = self.tmp / "models-dev.json"
+        os.environ["GIT_AI_USAGE_LITELLM_URL"] = self.litellm.as_uri()
+        os.environ["GIT_AI_USAGE_MODELS_DEV_URL"] = self.models_dev.as_uri()
+        self.write_sources(litellm_input=3)
+
+    def write_sources(self, litellm_input: float):
+        usd = 1e-6
+        self.litellm.write_text(json.dumps({
+            "gpt-6-sol": {"litellm_provider": "openai", "input_cost_per_token": litellm_input * usd,
+                          "output_cost_per_token": 30 * usd, "cache_read_input_token_cost": 0.3 * usd,
+                          "input_cost_per_token_priority": 6 * usd, "output_cost_per_token_priority": 60 * usd,
+                          "input_cost_per_token_above_272k_tokens_priority": 12 * usd,
+                          "output_cost_per_token_above_272k_tokens_priority": 90 * usd},
+            "claude-opus-5": {"litellm_provider": "anthropic", "input_cost_per_token": 6 * usd,
+                              "output_cost_per_token": 30 * usd, "provider_specific_entry": {"fast": 2}},
+        }))
+        self.models_dev.write_text(json.dumps({"openai": {"models": {
+            "gpt-6-sol": {"cost": {"input": 9, "output": 9, "tiers": [
+                {"input": 5, "output": 40, "cache_read": 0.5, "tier": {"type": "context", "size": 272000}}]}},
+            "gpt-9": {"cost": {"input": 1, "output": 2}},
+        }}}))
+
+    def refresh(self) -> str:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            tool.refresh_prices()
+        return stderr.getvalue()
+
+    def codex_call(self, model="gpt-6-sol", tokens_in=1000, tier="standard", when=T0):
+        tokens = {"in": tokens_in, "out": 1000, "cache_read": 0, "cache_write": 0}
+        return tool.Call(when, model, False, tokens, tool=tool.CODEX_TOOL, tier=tier)
+
+    def codex(self, *args, **kwargs):
+        return tool.priced(self.codex_call(*args, **kwargs))
+
+    def claude(self, fast: bool):
+        tokens = {"in": 1000, "out": 1000, "cache_read": 0, "cache_write": 0, "cache_write_1h": 0, "web_search": 0}
+        return tool.priced(tool.Call(T0, "claude-opus-5-20261001", fast, tokens))
+
+    def test_litellm_first_then_models_dev_then_builtin(self):
+        self.refresh()
+        cost, source = self.codex()
+        self.assertEqual(source, "litellm+models.dev")
+        self.assertAlmostEqual(cost, (1000 * 3 + 1000 * 30) / 1e6)
+        # LiteLLM has no long-context rates here, so models.dev's apply: 300K input at $5, output at $40.
+        self.assertAlmostEqual(self.codex(tokens_in=300_000)[0], (300_000 * 5 + 1000 * 40) / 1e6)
+        cost, source = self.codex(tier="priority")
+        self.assertEqual(source, "litellm")
+        self.assertAlmostEqual(cost, (1000 * 6 + 1000 * 60) / 1e6)
+        self.assertAlmostEqual(self.codex(tokens_in=300_000, tier="priority")[0], (300_000 * 12 + 1000 * 90) / 1e6)
+        # Only models.dev has gpt-9.
+        cost, source = self.codex("gpt-9")
+        self.assertEqual(source, "models.dev")
+        self.assertAlmostEqual(cost, (1000 * 1 + 1000 * 2) / 1e6)
+        # In neither source: the built-in Ultrafast rates of gpt-6.1-sol, $12 / $60.
+        cost, source = self.codex("gpt-6.1-sol", tier="ultrafast")
+        self.assertEqual(source, "builtin")
+        self.assertAlmostEqual(cost, (1000 * 12 + 1000 * 60) / 1e6)
+
+    def test_claude_fast_uses_the_litellm_multiplier(self):
+        self.refresh()
+        self.assertAlmostEqual(self.claude(fast=False)[0], (1000 * 6 + 1000 * 30) / 1e6)
+        cost, source = self.claude(fast=True)
+        self.assertEqual(source, "litellm")
+        self.assertAlmostEqual(cost, (1000 * 12 + 1000 * 60) / 1e6)
+
+    def test_a_failed_download_keeps_the_builtin_prices(self):
+        self.litellm.unlink()
+        self.models_dev.unlink()
+        self.assertIn("could not download the litellm prices", self.refresh())
+        cost, source = self.codex()
+        self.assertEqual(source, "builtin")
+        self.assertAlmostEqual(cost, (1000 * 2 + 1000 * 10) / 1e6)
+
+    def test_downloads_at_most_once_a_day(self):
+        self.refresh()
+        self.write_sources(litellm_input=4)
+        self.refresh()
+        self.assertAlmostEqual(self.codex()[0], (1000 * 3 + 1000 * 30) / 1e6)
+        day_old = time.time() - tool.PRICE_CACHE_SECONDS - 1
+        os.utime(tool.price_cache_path(), (day_old, day_old))
+        self.refresh()
+        self.assertAlmostEqual(self.codex()[0], (1000 * 4 + 1000 * 30) / 1e6)
+
+    def test_the_hook_and_offline_never_download(self):
+        self.commit(1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            tool.main(["hook", "post-commit"])
+            tool.main(["--offline", "backfill"])
+        self.assertFalse(tool.price_cache_path().exists())
+        del os.environ["GIT_AI_USAGE_OFFLINE"]
+        self.refresh()
+        self.assertEqual(self.codex()[1], "litellm+models.dev")
+        os.environ["GIT_AI_USAGE_OFFLINE"] = "1"
+        self.assertEqual(self.codex()[1], "builtin")
+
+    def test_builtin_prices_cover_the_gpt_5_models(self):
+        cost, source = self.codex("gpt-5.5-2026-04-23")
+        self.assertEqual(source, "builtin")
+        self.assertAlmostEqual(cost, (1000 * 5 + 1000 * 30) / 1e6)
+        self.assertAlmostEqual(self.codex("gpt-5.4", tokens_in=300_000)[0], (300_000 * 5 + 1000 * 22.5) / 1e6)
+        # The pro models have no cached rate, and a longer version is not priced as its prefix.
+        self.assertAlmostEqual(self.codex("gpt-5.5-pro")[0], (1000 * 30 + 1000 * 180) / 1e6)
+        self.assertEqual(self.codex("gpt-5.9")[1], "none")
+
+    def test_the_note_names_the_price_sources(self):
+        self.refresh()
+        tiers = ("standard", "priority", "flex")
+        calls = [self.codex_call(tier=tier, when=T0 + index) for index, tier in enumerate(tiers, 1)]
+        note = tool.note_for_window(T0, T0 + 10, calls, [])
+        self.assertIn(" price_src=builtin+litellm+models.dev ", note)
 
 
 if __name__ == "__main__":

@@ -60,9 +60,9 @@ by model:
   get notes. One line per tool and model, and one line per tool for edited lines:
 
   ```
-  claude-code model=claude-opus-4-1 in=1200 out=54000 cache_read=23000000 cache_write=410000 cost_usd=14.1200 from=1791000000 to=1791003600
+  claude-code model=claude-opus-4-1 in=1200 out=54000 cache_read=23000000 cache_write=410000 cost_usd=14.1200 price_src=litellm from=1791000000 to=1791003600
   claude-code added=212 deleted=31 from=1791000000 to=1791003600
-  codex model=gpt-5.6-sol in=3100 out=900 cache_read=410000 cache_write=0 cost_usd=0.1940 from=1791000000 to=1791003600
+  codex model=gpt-5.6-sol in=3100 out=900 cache_read=410000 cache_write=0 cost_usd=0.1940 price_src=litellm+models.dev from=1791000000 to=1791003600
   ```
 
   To sum, add the numeric keys of the unique lines. `from`/`to` (Unix seconds) make a line unique.
@@ -71,10 +71,19 @@ by model:
   A squash keeps the lines of all the squashed commits. An amend copy counts once.
 - **Sharing.** Git does not push notes by default. The `pre-push` hook pushes them after it
   merges the remote notes (`cat_sort_uniq`). To see the notes of other people: `git ai-usage fetch`.
-- **Cost** is the API price of the tokens. Claude Code: from the Claude Code model catalog. Codex:
-  the OpenAI list price, per response, with the long-context rate above 272K input tokens and the
-  rate of the processing mode (Fast, Flex). A model or mode with no price has a cost of 0. On a
-  subscription plan (or a ChatGPT seat) you pay a flat fee instead.
+- **Cost** is the API price of the tokens, per request or response. Codex gets the long-context
+  rate above 272K input tokens and the rate of the processing mode (Fast, Flex). On a subscription
+  plan (or a ChatGPT seat) you pay a flat fee instead.
+- **Prices** come from, in order:
+  1. [LiteLLM's price table](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json).
+  2. [models.dev](https://models.dev), for the models and long-context rates LiteLLM lacks.
+  3. The tables built into the script, from the Anthropic and OpenAI pricing pages.
+
+  `backfill` and `setup` download the first two at most once a day into
+  `~/.cache/git-ai-usage/prices.json` (or `$XDG_CACHE_HOME`). The post-commit hook only reads that
+  file, so a commit never waits on the network. `--offline` or `GIT_AI_USAGE_OFFLINE=1` uses only
+  the built-in tables. `price_src` on each note line says where its rates came from: `litellm`,
+  `models.dev`, `builtin`, or `none` for a model with no price, which costs 0.
 
 ## Limits
 
