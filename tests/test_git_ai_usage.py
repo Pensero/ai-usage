@@ -1,4 +1,4 @@
-"""End-to-end tests: real git repositories and fake Claude Code transcripts in a temporary HOME."""
+"""End-to-end tests: real git repositories and fake Claude Code and Codex transcripts in a temporary HOME."""
 
 from __future__ import annotations
 
@@ -41,6 +41,7 @@ class Sandbox(unittest.TestCase):
             "GIT_CONFIG_GLOBAL": str(gitconfig),
             "GIT_CONFIG_NOSYSTEM": "1",
             "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
+            "CODEX_HOME": str(self.home / ".codex"),
         })
         self.repo = self.tmp / "repo"
         self.repo.mkdir()
@@ -93,6 +94,28 @@ class Sandbox(unittest.TestCase):
                   "toolUseResult": {"type": "create", "content": "\n".join(["x"] * lines)}}
         with path.open("a") as handle:
             handle.write(json.dumps(record) + "\n")
+
+    def rollout(self, thread: str, cwd=None, model="gpt-5.6-sol", forked_from=None, folder="sessions") -> Path:
+        path = self.home / ".codex" / folder / "2026" / "10" / "16" / f"rollout-2026-10-16T10-00-00-{thread}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        meta = {"id": thread, "timestamp": iso(T0), "cwd": str(cwd or self.repo)}
+        if forked_from:
+            meta["forked_from_id"] = forked_from
+        self.codex_line(path, T0, "session_meta", meta)
+        self.codex_line(path, T0, "turn_context", {"cwd": str(cwd or self.repo), "model": model})
+        return path
+
+    def codex_line(self, path: Path, when: float, kind: str, payload: dict):
+        with path.open("a") as handle:
+            handle.write(json.dumps({"timestamp": iso(when), "type": kind, "payload": payload}) + "\n")
+
+    def response(self, path: Path, when: float, response_id: str, input=1000, cached=0, out=100):
+        usage = {"input_tokens": input, "cached_input_tokens": cached, "cache_write_input_tokens": 0,
+                 "output_tokens": out, "reasoning_output_tokens": 0, "total_tokens": input + out}
+        self.codex_line(path, when, "token_usage_record", {"response_id": response_id, "usage": usage})
+
+    def codex_note(self, sha: str) -> dict:
+        return {entry.get("model"): entry for entry in self.note(sha) if entry["_tool"] == "codex"}
 
     def note(self, sha: str) -> list[dict]:
         return tool.parse_note(tool.read_note(sha))
@@ -189,6 +212,99 @@ class BackfillTest(Sandbox):
         self.assertEqual(self.note(sha)[0]["out"], "100")
 
 
+class CodexTest(Sandbox):
+    def test_usage_and_patches_go_to_the_commit_window(self):
+        path = self.rollout("t1")
+        self.commit(1)
+        self.response(path, T0 + 1500, "r1", input=1000, cached=400, out=100)
+        patch = {"type": "item_completed", "item": {"type": "FileChange", "id": "p1", "status": "completed", "changes": {
+            "/repo/a.py": {"type": "add", "content": "a\nb\nc\n"},
+            "/repo/b.py": {"type": "update", "unified_diff": "--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new\n"},
+        }}}
+        self.codex_line(path, T0 + 1600, "event_msg", patch)
+        self.codex_line(path, T0 + 1700, "event_msg", patch)  # the same item again
+        second = self.commit(2)
+        self.response(path, T0 + 2500, "r2", out=7)
+        third = self.commit(3)
+
+        tool.backfill(EMAIL, quiet=True)
+
+        lines = self.codex_note(second)
+        usage, edited = lines["gpt-5.6-sol"], lines[None]
+        self.assertEqual((usage["in"], usage["cache_read"], usage["out"]), ("600", "400", "100"))
+        self.assertEqual((edited["added"], edited["deleted"]), ("4", "1"))
+        self.assertEqual(self.codex_note(third)["gpt-5.6-sol"]["out"], "7")
+
+    def test_skips_warmups_other_folders_and_copies(self):
+        path = self.rollout("t1")
+        self.commit(1)
+        self.response(path, T0 + 1100, "warmup", out=0)
+        self.response(path, T0 + 1200, "r1", out=10)
+        self.response(path, T0 + 1300, "r1", out=10)  # the same response again
+        self.codex_line(path, T0 + 1400, "turn_context", {"cwd": str(self.tmp / "elsewhere"), "model": "gpt-5.6-sol"})
+        self.response(path, T0 + 1500, "r2", out=999)
+        archived = self.rollout("t1", folder="archived_sessions")  # an archived copy of the same thread
+        self.response(archived, T0 + 1200, "r9", out=50)
+        sha = self.commit(2)
+        tool.backfill(EMAIL, quiet=True)
+        line = self.codex_note(sha)["gpt-5.6-sol"]
+        self.assertEqual((line["in"], line["out"]), ("1000", "10"))
+
+    def test_cost_is_per_response_with_long_context_rates(self):
+        path = self.rollout("t1")
+        self.commit(1)
+        self.response(path, T0 + 1100, "r1", input=200_000, out=1000)
+        self.response(path, T0 + 1200, "r2", input=200_000, out=1000)
+        short = self.commit(2)
+        self.response(path, T0 + 2100, "r3", input=300_000, out=1000)
+        long = self.commit(3)
+        tool.backfill(EMAIL, quiet=True)
+        # gpt-5.6-sol: $4 input and $20 output per 1M up to 272K input, $8 and $30 above.
+        self.assertAlmostEqual(float(self.codex_note(short)["gpt-5.6-sol"]["cost_usd"]), 2 * (0.8 + 0.02), places=4)
+        self.assertAlmostEqual(float(self.codex_note(long)["gpt-5.6-sol"]["cost_usd"]), 2.4 + 0.03, places=4)
+
+    def test_cost_uses_the_processing_mode(self):
+        path = self.rollout("t1")
+        self.commit(1)
+        settings = {"model": "gpt-5.6-sol", "cwd": str(self.repo), "service_tier": "fast"}
+        self.codex_line(path, T0 + 1050, "event_msg", {"type": "thread_settings_applied", "thread_settings": settings})
+        self.response(path, T0 + 1100, "r1", input=1000, out=1000)
+        fast = self.commit(2)
+        settings["service_tier"] = "ultrafast"  # no Ultrafast price for this model
+        self.codex_line(path, T0 + 2050, "event_msg", {"type": "thread_settings_applied", "thread_settings": settings})
+        self.response(path, T0 + 2100, "r2", input=1000, out=1000)
+        unpriced = self.commit(3)
+        tool.backfill(EMAIL, quiet=True)
+        self.assertAlmostEqual(float(self.codex_note(fast)["gpt-5.6-sol"]["cost_usd"]), 0.008 + 0.04, places=4)
+        self.assertEqual(self.codex_note(unpriced)["gpt-5.6-sol"]["cost_usd"], "0.0000")
+
+    def test_token_count_is_the_fallback_for_old_files(self):
+        path = self.rollout("t1", model="gpt-5.3-codex")
+        self.commit(1)
+        last = {"input_tokens": 100_000, "cached_input_tokens": 0, "output_tokens": 10_000}
+        info = {"total_token_usage": {"total_tokens": 110_000}, "last_token_usage": last}
+        self.codex_line(path, T0 + 1100, "event_msg", {"type": "token_count", "info": info})
+        self.codex_line(path, T0 + 1200, "event_msg", {"type": "token_count", "info": info})  # only rate limits changed
+        sha = self.commit(2)
+        tool.backfill(EMAIL, quiet=True)
+        line = self.codex_note(sha)["gpt-5.3-codex"]
+        self.assertEqual(line["out"], "10000")
+        self.assertAlmostEqual(float(line["cost_usd"]), 0.175 + 0.14, places=4)
+
+    def test_claude_and_codex_in_one_note(self):
+        transcript = self.transcript()
+        rollout = self.rollout("t1")
+        self.commit(1)
+        self.call(transcript, T0 + 1100, out=20)
+        self.response(rollout, T0 + 1200, "r1", out=30)
+        sha = self.commit(2)
+        tool.backfill(EMAIL, quiet=True)
+        self.assertEqual([entry["_tool"] for entry in self.note(sha)], ["claude-code", "codex"])
+        _, per_model, total = self.totals(sha)
+        self.assertEqual(total.tokens["out"], 50)
+        self.assertEqual({model: t.tool for model, t in per_model.items()}, {"claude-opus-4-1": "claude-code", "gpt-5.6-sol": "codex"})
+
+
 class HookTest(Sandbox):
     def setUp(self):
         super().setUp()
@@ -233,6 +349,17 @@ class HookTest(Sandbox):
         sha = self.commit(1)
         self.assertTrue((self.repo / "marker.txt").exists())
         self.assertEqual(self.note(sha)[0]["out"], "33")
+
+    def test_codex_fork_counts_the_copied_parent_records_once(self):
+        parent = self.rollout("parent")
+        self.response(parent, T0 + 500, "r1", out=10)
+        self.commit(1)
+        os.utime(parent, (T0 + 600, T0 + 600))  # the parent did not change after commit 1
+        fork = self.rollout("fork", forked_from="parent")
+        self.response(fork, T0 + 1500, "r1", out=10)  # copied from the parent
+        self.response(fork, T0 + 1600, "r2", out=5)
+        sha = self.commit(2)
+        self.assertEqual(self.codex_note(sha)["gpt-5.6-sol"]["out"], "5")
 
     def test_hook_never_fails_the_commit(self):
         path = self.transcript()

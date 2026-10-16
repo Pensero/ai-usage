@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """git ai-usage: record local AI coding-agent usage per commit in git notes.
 
-Reads the Claude Code transcripts on this machine (~/.claude/projects/**/*.jsonl) and writes,
-for each of your commits, the tokens and the derived cost of the work done in the repository
-since your previous commit. The data goes to the notes ref refs/notes/ai-usage, so commit SHAs
-do not change and past commits can be backfilled.
+Reads the Claude Code transcripts (~/.claude/projects/**/*.jsonl) and the Codex rollout files
+(~/.codex/sessions/**/rollout-*.jsonl) on this machine and writes, for each of your commits, the
+tokens and the derived cost of the work done in the repository since your previous commit. The
+data goes to the notes ref refs/notes/ai-usage, so commit SHAs do not change and past commits can
+be backfilled.
 
 A commit gets the usage between your previous commit and its author date, from transcripts
 whose working directory is inside the repository (or one of its worktrees). Each usage record
 belongs to exactly one window, so no record is counted twice.
 
-Note format, one line per model (plus one line for edited lines):
+Note format, one line per tool and model (plus one line per tool for edited lines):
 
     claude-code model=claude-opus-4-1 in=1200 out=5400 cache_read=230000 cache_write=12000 cost_usd=1.8400 from=1791000000 to=1791003600
     claude-code added=120 deleted=14 from=1791000000 to=1791003600
+    codex model=gpt-5.6-sol in=3100 out=900 cache_read=410000 cache_write=0 cost_usd=0.1940 from=1791000000 to=1791003600
 
 Readers sum the numeric keys of the unique lines. The window (from, to) makes a line unique, so
 a note copied twice by an amend is counted once and a squash keeps the lines of both commits.
@@ -33,11 +35,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 NOTES_REF = "refs/notes/ai-usage"
 REMOTE_COPY_REF = "refs/notes/ai-usage-remote"
-TOOL = "claude-code"
+CLAUDE_TOOL = "claude-code"
+CODEX_TOOL = "codex"
+TOOLS = (CLAUDE_TOOL, CODEX_TOOL)
 TOKEN_KEYS = ("in", "out", "cache_read", "cache_write")
 EDIT_KEYS = ("added", "deleted")
 # Not --all: the commits of refs/notes/* and refs/stash are yours too, and their times would
@@ -84,6 +88,48 @@ MODEL_TIERS = {
     "claude-3-5-haiku": "haiku_35",
     "claude-fable-5": "tier_10_50",
     "claude-mythos-5": "tier_10_50",
+}
+
+# Codex: OpenAI list prices in USD per 1,000,000 tokens, from https://developers.openai.com/api/docs/pricing
+# (read 2026-10-15, the same values as the Pensero seed). Per processing mode, then per model:
+# (input, cached input, cache write, output), then the long-context rates (None: one price for
+# every request size). A cache write with no price costs the input price. A mode with no price for
+# a model gives no cost: it does not fall back to Standard.
+CODEX_LONG_CONTEXT_TOKENS = 272_000
+CODEX_PRICES = {
+    "standard": {
+        "gpt-6-astra": ((10, 1, 12.5, 50), (20, 2, 25, 75)),
+        "gpt-6.1-sol": ((2, 0.1, 2.5, 10), (4, 0.2, 5, 15)),
+        "gpt-6-luna": ((0.1, 0.01, 0.125, 0.5), (0.2, 0.02, 0.25, 0.75)),
+        "gpt-6-sol": ((2, 0.2, 2.5, 10), (4, 0.4, 5, 15)),
+        "gpt-5.6-sol": ((4, 0.4, 5, 20), (8, 0.8, 10, 30)),
+        "gpt-5.6-terra": ((2, 0.2, 2.5, 12), (4, 0.4, 5, 18)),
+        "gpt-5.6-luna": ((0.2, 0.02, 0.25, 1.2), (0.4, 0.04, 0.5, 1.8)),
+        "gpt-5.3-codex": ((1.75, 0.175, None, 14), None),
+    },
+    "flex": {
+        "gpt-6-astra": ((5, 0.5, 6.25, 25), (10, 1, 12.5, 37.5)),
+        "gpt-6.1-sol": ((1, 0.05, 1.25, 5), (2, 0.1, 2.5, 7.5)),
+        "gpt-6-luna": ((0.05, 0.005, 0.0625, 0.25), (0.1, 0.01, 0.125, 0.375)),
+        "gpt-6-sol": ((1, 0.1, 1.25, 5), (2, 0.2, 2.5, 7.5)),
+        "gpt-5.6-sol": ((2, 0.2, 2.5, 10), (4, 0.4, 5, 15)),
+        "gpt-5.6-terra": ((1, 0.1, 1.25, 6), (2, 0.2, 2.5, 9)),
+        "gpt-5.6-luna": ((0.1, 0.01, 0.125, 0.6), (0.2, 0.02, 0.25, 0.9)),
+    },
+    "priority": {
+        "gpt-6-astra": ((20, 2, 25, 100), (40, 4, 50, 150)),
+        "gpt-6.1-sol": ((4, 0.2, 5, 20), (8, 0.4, 10, 30)),
+        "gpt-6-luna": ((0.2, 0.02, 0.25, 1), (0.4, 0.04, 0.5, 1.5)),
+        "gpt-6-sol": ((4, 0.4, 5, 20), (8, 0.8, 10, 30)),
+        "gpt-5.6-sol": ((8, 0.8, 10, 40), (16, 1.6, 20, 60)),
+        "gpt-5.6-terra": ((4, 0.4, 5, 24), (8, 0.8, 10, 36)),
+        "gpt-5.6-luna": ((0.4, 0.04, 0.5, 2.4), (0.8, 0.08, 1, 3.6)),
+        "gpt-5.3-codex": ((3.5, 0.35, None, 28), None),
+    },
+    "ultrafast": {
+        "gpt-6-astra": ((60, 6, 75, 300), (120, 12, 150, 450)),
+        "gpt-6.1-sol": ((12, 0.6, 15, 60), (24, 1.2, 30, 90)),
+    },
 }
 
 
@@ -221,6 +267,8 @@ class Call:
     model: str
     fast: bool
     tokens: dict
+    tool: str = CLAUDE_TOOL
+    tier: str = ""
 
 
 @dataclass
@@ -228,6 +276,7 @@ class Edit:
     when: float
     added: int
     deleted: int
+    tool: str = CLAUDE_TOOL
 
 
 def edited_lines(result: dict) -> tuple[int, int]:
@@ -312,6 +361,8 @@ def rates_for(model: str, fast: bool = False) -> dict | None:
 
 
 def cost_usd(call: Call) -> float:
+    if call.tool == CODEX_TOOL:
+        return codex_cost_usd(call)
     rates = rates_for(call.model, call.fast)
     if not rates:
         return 0.0
@@ -321,6 +372,248 @@ def cost_usd(call: Call) -> float:
     per_million = one_hour * rates["cache_write_1h"] + (written - one_hour) * rates["cache_write"]
     per_million += tokens["in"] * rates["input"] + tokens["out"] * rates["output"] + tokens["cache_read"] * rates["cache_read"]
     return per_million / 1_000_000 + tokens["web_search"] * WEB_SEARCH_USD
+
+
+# --- Codex rollouts -------------------------------------------------------------
+
+
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+
+
+ROLLOUT_NAME = re.compile(r"^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(?P<thread>.+)\.jsonl$")
+
+
+def rollout_files() -> dict[str, Path]:
+    """Rollout files by thread id, oldest first. A file in both folders counts once, from sessions/."""
+    files: dict[str, Path] = {}
+    for folder in ("archived_sessions", "sessions"):
+        root = codex_home() / folder
+        if root.is_dir():
+            for path in root.rglob("rollout-*.jsonl"):
+                match = ROLLOUT_NAME.match(path.name)
+                files[match["thread"] if match else path.stem] = path
+    return dict(sorted(files.items(), key=lambda item: item[1].name))
+
+
+def codex_tier(value: object) -> str:
+    """The processing mode Codex asked for. Codex sends none for Standard and `priority` for Fast."""
+    tier = str(value or "").strip().lower()
+    if tier in ("", "default", "auto"):
+        return "standard"
+    return "priority" if tier == "fast" else tier
+
+
+def _dict(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def changed_lines(changes: object) -> tuple[int, int]:
+    """Lines added and deleted by one applied patch. A deleted file counts no lines: its patch lists none."""
+    added = deleted = 0
+    for change in changes.values() if isinstance(changes, dict) else []:
+        kind = change.get("type") if isinstance(change, dict) else None
+        if kind == "add":
+            added += len(str(change.get("content") or "").splitlines())
+        elif kind == "update":
+            in_hunk = False
+            for line in str(change.get("unified_diff") or "").splitlines():
+                if line.startswith("@@"):
+                    in_hunk = True
+                elif in_hunk and line.startswith("+"):
+                    added += 1
+                elif in_hunk and line.startswith("-"):
+                    deleted += 1
+    return added, deleted
+
+
+def applied_patch(payload: dict) -> tuple[str, object] | None:
+    """(id, changes) of a successful patch: a completed `FileChange` item, or a legacy `patch_apply_end`."""
+    if payload.get("type") == "item_completed":
+        item = _dict(payload.get("item"))
+        if item.get("type") == "FileChange" and str(item.get("status")).lower() == "completed":
+            return str(item.get("id") or ""), item.get("changes")
+    elif payload.get("type") == "patch_apply_end" and payload.get("success") is True:
+        return str(payload.get("call_id") or ""), payload.get("changes")
+    return None
+
+
+def token_count_key(total: object, last: dict) -> str:
+    """Id of a legacy `token_count` response, which has no response id. A fork copies it with the
+    same running total, so the total and the response's own usage together identify it."""
+    if not isinstance(total, dict) or not total:
+        return "token_count|"
+    return f"token_count|{json.dumps(total, sort_keys=True)}|{json.dumps(last, sort_keys=True)}"
+
+
+@dataclass
+class _Thread:
+    """What one rollout file has said so far."""
+
+    cwd: str = ""
+    model: str = "unknown"
+    tier: str = ""
+    has_records: bool = False
+    legacy: list = field(default_factory=list)
+
+
+class CodexRollouts:
+    """Reads rollout files into calls and edits.
+
+    The parsing follows `otel_collector/codex_report.py` in Pensero/pensero, which matches the Codex
+    OTel export. Ids are kept across files, because a fork copies the records of its parent: the
+    parent is read first, so a copied record counts once even when only the fork changed.
+    """
+
+    def __init__(self, roots: list[str], files: dict[str, Path]) -> None:
+        self.roots = roots
+        self.files = files
+        self.done: set[str] = set()
+        self.seen: set[str] = set()
+        self.calls: list[Call] = []
+        self.edits: list[Edit] = []
+
+    def read(self, thread: str) -> None:
+        if thread in self.done or thread not in self.files:
+            return
+        self.done.add(thread)
+        state = _Thread()
+        try:
+            handle = self.files[thread].open(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        with handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                    if isinstance(record, dict):
+                        self._record(state, record)
+                except (ValueError, KeyError, TypeError, AttributeError):
+                    # An open session has a half-written last line.
+                    continue
+        if not state.has_records:
+            # Files from before `token_usage_record` carry the per-response usage only in `token_count`.
+            for key, when, cwd, model, tier, usage in state.legacy:
+                if self._first(key):
+                    self._response(when, cwd, model, tier, usage)
+
+    def _record(self, state: _Thread, record: dict) -> None:
+        payload = _dict(record.get("payload"))
+        kind = record.get("type")
+        if kind == "session_meta":
+            if payload.get("forked_from_id"):
+                self.read(str(payload["forked_from_id"]))
+            state.cwd = str(payload.get("cwd") or state.cwd)
+            return
+        if kind == "turn_context":
+            state.cwd = str(payload.get("cwd") or state.cwd)
+            state.model = str(payload.get("model") or state.model)
+            return
+        when = parse_time(record["timestamp"])
+        if kind == "token_usage_record":
+            state.has_records = True
+            if self._first(f"response|{payload.get('response_id') or ''}"):
+                self._response(when, state.cwd, state.model, state.tier, payload.get("usage"))
+        elif kind == "event_msg":
+            self._event(state, when, payload)
+
+    def _event(self, state: _Thread, when: float, payload: dict) -> None:
+        kind = payload.get("type")
+        if kind == "thread_settings_applied":
+            settings = _dict(payload.get("thread_settings"))
+            state.cwd = str(settings.get("cwd") or state.cwd)
+            state.model = str(settings.get("model") or state.model)
+            state.tier = str(settings.get("service_tier") or "")
+        elif kind == "token_count":
+            info = _dict(payload.get("info"))
+            total, last = info.get("total_token_usage"), info.get("last_token_usage")
+            # Codex sends the same count again when only the rate limits change: the key removes it.
+            if isinstance(last, dict):
+                state.legacy.append((token_count_key(total, last), when, state.cwd, state.model, state.tier, last))
+        elif (patch := applied_patch(payload)) and self._first(f"patch|{patch[0]}") and inside(state.cwd, self.roots):
+            added, deleted = changed_lines(patch[1])
+            if added or deleted:
+                self.edits.append(Edit(when, added, deleted, CODEX_TOOL))
+
+    def _response(self, when: float, cwd: str, model: str, tier: str, usage: object) -> None:
+        usage = _dict(usage)
+
+        def count(key: str) -> int:
+            return int(usage.get(key) or 0)
+
+        out = count("output_tokens")
+        # A response with no output is the warmup at the start of a session: the OTel export leaves it out too.
+        if out <= 0 or not inside(cwd, self.roots):
+            return
+        cached, written = count("cached_input_tokens"), count("cache_write_input_tokens")
+        tokens = {
+            # Codex input includes the cached and cache-write tokens; `in` does not, as for Claude Code.
+            "in": max(count("input_tokens") - cached - written, 0),
+            "out": out,
+            "cache_read": cached,
+            "cache_write": written,
+            "cache_write_1h": 0,
+            "web_search": 0,
+        }
+        self.calls.append(Call(when, model, False, tokens, CODEX_TOOL, codex_tier(tier)))
+
+    def _first(self, key: str) -> bool:
+        """True the first time an id is seen. A record with no id always counts."""
+        if key.endswith("|"):
+            return True
+        if key in self.seen:
+            return False
+        self.seen.add(key)
+        return True
+
+
+def read_rollouts(roots: list[str], since: float | None = None) -> tuple[list[Call], list[Edit]]:
+    """All Codex usage recorded in the repository, from rollout files changed after `since`."""
+    files = rollout_files()
+    rollouts = CodexRollouts(roots, files)
+    for thread, path in files.items():
+        try:
+            if since is not None and path.stat().st_mtime < since:
+                continue
+        except OSError:
+            continue
+        rollouts.read(thread)
+    return rollouts.calls, rollouts.edits
+
+
+def codex_rates(model: str, tier: str) -> tuple | None:
+    prices = CODEX_PRICES.get(tier, {})
+    if model in prices:
+        return prices[model]
+    for key in sorted(prices, key=len, reverse=True):
+        if model.startswith(key):
+            return prices[key]
+    return None
+
+
+def codex_cost_usd(call: Call) -> float:
+    """Cost of one response. Long-context rates depend on the input of one request, so never price a sum."""
+    prices = codex_rates(call.model, call.tier)
+    if not prices:
+        return 0.0
+    tokens = call.tokens
+    short, long = prices
+    full_input = tokens["in"] + tokens["cache_read"] + tokens["cache_write"]
+    input_rate, cached_rate, write_rate, output_rate = long if long and full_input > CODEX_LONG_CONTEXT_TOKENS else short
+    per_million = (
+        tokens["in"] * input_rate
+        + tokens["cache_read"] * cached_rate
+        + tokens["cache_write"] * (input_rate if write_rate is None else write_rate)
+        + tokens["out"] * output_rate
+    )
+    return per_million / 1_000_000
+
+
+def read_usage(roots: list[str], since: float | None = None) -> tuple[list[Call], list[Edit]]:
+    """The usage of every supported agent in the repository."""
+    calls, edits = read_transcripts(roots, since)
+    codex_calls, codex_edits = read_rollouts(roots, since)
+    return calls + codex_calls, edits + codex_edits
 
 
 # --- windows and notes ----------------------------------------------------------
@@ -334,25 +627,26 @@ def window_of(author_time: int, bounds: list[int]) -> tuple[int, int]:
 
 
 def note_for_window(start: int, end: int, calls: list[Call], edits: list[Edit]) -> str:
-    per_model: dict[str, dict] = defaultdict(lambda: {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0})
+    per_model: dict[tuple[str, str], dict] = defaultdict(lambda: {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0})
     for call in calls:
         if start < call.when <= end:
-            total = per_model[call.model or "unknown"]
+            total = per_model[(call.tool, call.model or "unknown")]
             for key in TOKEN_KEYS:
                 total[key] += call.tokens[key]
             total["cost"] += cost_usd(call)
-    added = sum(edit.added for edit in edits if start < edit.when <= end)
-    deleted = sum(edit.deleted for edit in edits if start < edit.when <= end)
     lines = []
     span = f"from={start} to={end}"
-    for model in sorted(per_model):
-        total = per_model[model]
-        if not any(total[key] for key in TOKEN_KEYS):
-            continue
-        counts = " ".join(f"{key}={total[key]}" for key in TOKEN_KEYS)
-        lines.append(f"{TOOL} model={model} {counts} cost_usd={total['cost']:.4f} {span}")
-    if added or deleted:
-        lines.append(f"{TOOL} added={added} deleted={deleted} {span}")
+    for tool in TOOLS:
+        for _, model in sorted(key for key in per_model if key[0] == tool):
+            total = per_model[(tool, model)]
+            if not any(total[key] for key in TOKEN_KEYS):
+                continue
+            counts = " ".join(f"{key}={total[key]}" for key in TOKEN_KEYS)
+            lines.append(f"{tool} model={model} {counts} cost_usd={total['cost']:.4f} {span}")
+        added = sum(edit.added for edit in edits if edit.tool == tool and start < edit.when <= end)
+        deleted = sum(edit.deleted for edit in edits if edit.tool == tool and start < edit.when <= end)
+        if added or deleted:
+            lines.append(f"{tool} added={added} deleted={deleted} {span}")
     return "".join(line + "\n" for line in lines)
 
 
@@ -360,9 +654,9 @@ def parse_note(text: str) -> list[dict]:
     entries = []
     for line in text.splitlines():
         parts = line.split()
-        if not parts or parts[0] != TOOL:
+        if not parts or parts[0] not in TOOLS:
             continue
-        entry = {"_line": line.strip()}
+        entry = {"_line": line.strip(), "_tool": parts[0]}
         for part in parts[1:]:
             key, _, value = part.partition("=")
             entry[key] = value
@@ -376,8 +670,10 @@ class Totals:
     cost: float = 0.0
     added: int = 0
     deleted: int = 0
+    tool: str = ""
 
     def add(self, entry: dict) -> None:
+        self.tool = entry.get("_tool", self.tool)
         for key in TOKEN_KEYS:
             self.tokens[key] += int(entry.get(key, 0) or 0)
         self.cost += float(entry.get("cost_usd", 0) or 0)
@@ -419,7 +715,7 @@ def backfill(email: str, force: bool = False, extra_paths: list[str] | None = No
     bounds = own_commit_times(email)
     if not bounds:
         return 0
-    calls, edits = read_transcripts(roots)
+    calls, edits = read_usage(roots)
     if not calls and not edits:
         return 0
     first_usage = min(item.when for item in [*calls, *edits])
@@ -452,7 +748,7 @@ def note_head() -> None:
         return
     bounds = own_commit_times(email)
     start, end = window_of(commit.author_time, bounds)
-    calls, edits = read_transcripts(repo_roots(), since=start or None)
+    calls, edits = read_usage(repo_roots(), since=start or None)
     text = note_for_window(start, end, calls, edits)
     if text:
         write_note(commit.sha, text)
@@ -489,7 +785,7 @@ def show(revision: str | None, as_json: bool) -> None:
                 {"sha": c.sha, "subject": c.subject, **t.tokens, "cost_usd": round(t.cost, 4), "added": t.added, "deleted": t.deleted}
                 for c, t in per_commit
             ],
-            "models": {m: {**t.tokens, "cost_usd": round(t.cost, 4)} for m, t in per_model.items()},
+            "models": {m: {"tool": t.tool, **t.tokens, "cost_usd": round(t.cost, 4)} for m, t in per_model.items()},
             "total": {**grand.tokens, "cost_usd": round(grand.cost, 4), "added": grand.added, "deleted": grand.deleted},
         }, indent=2))
         return
@@ -510,7 +806,7 @@ def show(revision: str | None, as_json: bool) -> None:
     if per_model:
         print("\nby model:")
         for model, total in sorted(per_model.items(), key=lambda item: -item[1].cost):
-            print(f"  {model:40} {total.cost:>8.2f} $  out={format_tokens(total.tokens['out'])}")
+            print(f"  {total.tool + ' ' + model:52} {total.cost:>8.2f} $  out={format_tokens(total.tokens['out'])}")
 
 
 def hook_block(name: str) -> str:
@@ -603,7 +899,7 @@ def ask(question: str, default: bool = True) -> bool:
 def setup() -> None:
     install()
     email = user_email()
-    if ask(f"Backfill notes for your past commits ({email}) from the local Claude Code transcripts?"):
+    if ask(f"Backfill notes for your past commits ({email}) from the local Claude Code and Codex transcripts?"):
         written = backfill(email)
         print(f"Wrote {written} note{'' if written == 1 else 's'}.")
     remote = "origin" if git_ok("remote", "get-url", "origin") else None
