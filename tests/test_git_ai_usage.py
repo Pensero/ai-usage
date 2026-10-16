@@ -318,7 +318,48 @@ class CodexTest(Sandbox):
         self.assertEqual([entry["_tool"] for entry in self.note(sha)], ["claude-code", "codex"])
         _, per_model, total = self.totals(sha)
         self.assertEqual(total.tokens["out"], 50)
-        self.assertEqual({model: t.tool for model, t in per_model.items()}, {"claude-opus-4-1": "claude-code", "gpt-5.6-sol": "codex"})
+        self.assertEqual(set(per_model), {("claude-code", "claude-opus-4-1"), ("codex", "gpt-5.6-sol")})
+
+    def test_a_model_name_in_both_tools_stays_apart(self):
+        note = "claude-code model=shared out=20 from=1 to=2\ncodex model=shared out=30 from=1 to=2\n"
+        _, per_model, _ = tool.summarize([(None, note)])
+        self.assertEqual({key: t.tokens["out"] for key, t in per_model.items()}, {("claude-code", "shared"): 20, ("codex", "shared"): 30})
+
+    def legacy_count(self, path: Path, when: float, total: int, out: int):
+        last = {"input_tokens": 1000, "cached_input_tokens": 0, "output_tokens": out}
+        info = {"total_token_usage": {"total_tokens": total}, "last_token_usage": last}
+        self.codex_line(path, when, "event_msg", {"type": "token_count", "info": info})
+
+    def test_a_file_resumed_by_a_newer_codex_keeps_its_old_turns(self):
+        path = self.rollout("t1")
+        self.commit(1)
+        self.legacy_count(path, T0 + 1100, total=1100, out=100)
+        self.codex_line(path, T0 + 1200, "turn_context", {"cwd": str(self.repo), "model": "gpt-5.6-sol"})
+        self.response(path, T0 + 1300, "r1", out=50)
+        self.legacy_count(path, T0 + 1300, total=2150, out=50)  # the same response as r1
+        sha = self.commit(2)
+        tool.backfill(EMAIL, quiet=True)
+        self.assertEqual(self.codex_note(sha)["gpt-5.6-sol"]["out"], "150")
+
+    def test_old_sessions_that_start_the_same_way_both_count(self):
+        first, second = self.rollout("t1"), self.rollout("t2")
+        self.commit(1)
+        self.legacy_count(first, T0 + 1100, total=1100, out=100)
+        self.legacy_count(second, T0 + 1200, total=1100, out=100)
+        sha = self.commit(2)
+        tool.backfill(EMAIL, quiet=True)
+        self.assertEqual(self.codex_note(sha)["gpt-5.6-sol"]["out"], "200")
+
+    def test_an_old_fork_counts_the_copied_parent_responses_once(self):
+        parent = self.rollout("parent")
+        self.commit(1)
+        self.legacy_count(parent, T0 + 1100, total=1100, out=100)
+        fork = self.rollout("fork", forked_from="parent")
+        self.legacy_count(fork, T0 + 1100, total=1100, out=100)  # copied from the parent
+        self.legacy_count(fork, T0 + 1200, total=2130, out=30)
+        sha = self.commit(2)
+        tool.backfill(EMAIL, quiet=True)
+        self.assertEqual(self.codex_note(sha)["gpt-5.6-sol"]["out"], "130")
 
 
 class HookTest(Sandbox):
@@ -393,7 +434,7 @@ class HookTest(Sandbox):
         per_commit, per_model, total = self.totals("base..HEAD")
         self.assertEqual(len(per_commit), 2)
         self.assertEqual(total.tokens["out"], 30)
-        self.assertEqual(set(per_model), {"claude-opus-4-1", "claude-sonnet-4-5"})
+        self.assertEqual(set(per_model), {("claude-code", "claude-opus-4-1"), ("claude-code", "claude-sonnet-4-5")})
 
 
 class RemoteTest(Sandbox):

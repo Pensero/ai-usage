@@ -438,23 +438,27 @@ def applied_patch(payload: dict) -> tuple[str, object] | None:
     return None
 
 
-def token_count_key(total: object, last: dict) -> str:
+def token_count_key(origin: str, total: object, last: dict) -> str:
     """Id of a legacy `token_count` response, which has no response id. A fork copies it with the
-    same running total, so the total and the response's own usage together identify it."""
+    same running total, so the first thread of the fork chain (`origin`), the total and the
+    response's own usage together identify it. Without `origin`, two sessions that start the same
+    way would share an id."""
     if not isinstance(total, dict) or not total:
         return "token_count|"
-    return f"token_count|{json.dumps(total, sort_keys=True)}|{json.dumps(last, sort_keys=True)}"
+    return f"token_count|{origin}|{json.dumps(total, sort_keys=True)}|{json.dumps(last, sort_keys=True)}"
 
 
 @dataclass
 class _Thread:
     """What one rollout file has said so far."""
 
+    thread: str
+    origin: str
     cwd: str = ""
     model: str = "unknown"
     tier: str = ""
-    has_records: bool = False
-    legacy: list = field(default_factory=list)
+    turn_has_records: bool = False
+    turn_legacy: list = field(default_factory=list)
 
 
 class CodexRollouts:
@@ -469,6 +473,7 @@ class CodexRollouts:
         self.roots = roots
         self.files = files
         self.done: set[str] = set()
+        self.origins: dict[str, str] = {}
         self.seen: set[str] = set()
         self.calls: list[Call] = []
         self.edits: list[Edit] = []
@@ -477,7 +482,8 @@ class CodexRollouts:
         if thread in self.done or thread not in self.files:
             return
         self.done.add(thread)
-        state = _Thread()
+        state = _Thread(thread=thread, origin=thread)
+        self.origins[thread] = thread
         try:
             handle = self.files[thread].open(encoding="utf-8", errors="replace")
         except OSError:
@@ -491,27 +497,36 @@ class CodexRollouts:
                 except (ValueError, KeyError, TypeError, AttributeError):
                     # An open session has a half-written last line.
                     continue
-        if not state.has_records:
-            # Files from before `token_usage_record` carry the per-response usage only in `token_count`.
-            for key, when, cwd, model, tier, usage in state.legacy:
+        self._end_turn(state)
+
+    def _end_turn(self, state: _Thread) -> None:
+        """A turn from before `token_usage_record` (or a file resumed by a newer Codex) carries the
+        per-response usage only in `token_count`. A turn with records counts the records alone."""
+        if not state.turn_has_records:
+            for key, when, cwd, model, tier, usage in state.turn_legacy:
                 if self._first(key):
                     self._response(when, cwd, model, tier, usage)
+        state.turn_has_records = False
+        state.turn_legacy = []
 
     def _record(self, state: _Thread, record: dict) -> None:
         payload = _dict(record.get("payload"))
         kind = record.get("type")
         if kind == "session_meta":
             if payload.get("forked_from_id"):
-                self.read(str(payload["forked_from_id"]))
+                parent = str(payload["forked_from_id"])
+                self.read(parent)
+                state.origin = self.origins[state.thread] = self.origins.get(parent, parent)
             state.cwd = str(payload.get("cwd") or state.cwd)
             return
         if kind == "turn_context":
+            self._end_turn(state)
             state.cwd = str(payload.get("cwd") or state.cwd)
             state.model = str(payload.get("model") or state.model)
             return
         when = parse_time(record["timestamp"])
         if kind == "token_usage_record":
-            state.has_records = True
+            state.turn_has_records = True
             if self._first(f"response|{payload.get('response_id') or ''}"):
                 self._response(when, state.cwd, state.model, state.tier, payload.get("usage"))
         elif kind == "event_msg":
@@ -529,7 +544,8 @@ class CodexRollouts:
             total, last = info.get("total_token_usage"), info.get("last_token_usage")
             # Codex sends the same count again when only the rate limits change: the key removes it.
             if isinstance(last, dict):
-                state.legacy.append((token_count_key(total, last), when, state.cwd, state.model, state.tier, last))
+                key = token_count_key(state.origin, total, last)
+                state.turn_legacy.append((key, when, state.cwd, state.model, state.tier, last))
         elif (patch := applied_patch(payload)) and self._first(f"patch|{patch[0]}") and inside(state.cwd, self.roots):
             added, deleted = changed_lines(patch[1])
             if added or deleted:
@@ -681,12 +697,12 @@ class Totals:
         self.deleted += int(entry.get("deleted", 0) or 0)
 
 
-def summarize(notes: list[tuple[Commit, str]]) -> tuple[list[tuple[Commit, Totals]], dict[str, Totals], Totals]:
-    """Per-commit and per-model totals. A line seen on two commits (a cherry-pick or a rebased
+def summarize(notes: list[tuple[Commit, str]]) -> tuple[list[tuple[Commit, Totals]], dict[tuple[str, str], Totals], Totals]:
+    """Per-commit and per-(tool, model) totals. A line seen on two commits (a cherry-pick or a rebased
     copy) counts once."""
     seen: set[str] = set()
     per_commit = []
-    per_model: dict[str, Totals] = defaultdict(Totals)
+    per_model: dict[tuple[str, str], Totals] = defaultdict(Totals)
     grand = Totals()
     for commit, note in notes:
         commit_total = Totals()
@@ -697,7 +713,7 @@ def summarize(notes: list[tuple[Commit, str]]) -> tuple[list[tuple[Commit, Total
             commit_total.add(entry)
             grand.add(entry)
             if "model" in entry:
-                per_model[entry["model"]].add(entry)
+                per_model[(entry["_tool"], entry["model"])].add(entry)
         per_commit.append((commit, commit_total))
     return per_commit, dict(per_model), grand
 
@@ -785,7 +801,9 @@ def show(revision: str | None, as_json: bool) -> None:
                 {"sha": c.sha, "subject": c.subject, **t.tokens, "cost_usd": round(t.cost, 4), "added": t.added, "deleted": t.deleted}
                 for c, t in per_commit
             ],
-            "models": {m: {"tool": t.tool, **t.tokens, "cost_usd": round(t.cost, 4)} for m, t in per_model.items()},
+            "models": [
+                {"tool": tool, "model": model, **t.tokens, "cost_usd": round(t.cost, 4)} for (tool, model), t in sorted(per_model.items())
+            ],
             "total": {**grand.tokens, "cost_usd": round(grand.cost, 4), "added": grand.added, "deleted": grand.deleted},
         }, indent=2))
         return
@@ -805,8 +823,8 @@ def show(revision: str | None, as_json: bool) -> None:
     )
     if per_model:
         print("\nby model:")
-        for model, total in sorted(per_model.items(), key=lambda item: -item[1].cost):
-            print(f"  {total.tool + ' ' + model:52} {total.cost:>8.2f} $  out={format_tokens(total.tokens['out'])}")
+        for (tool, model), total in sorted(per_model.items(), key=lambda item: -item[1].cost):
+            print(f"  {tool + ' ' + model:52} {total.cost:>8.2f} $  out={format_tokens(total.tokens['out'])}")
 
 
 def hook_block(name: str) -> str:
