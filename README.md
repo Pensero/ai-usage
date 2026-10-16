@@ -8,12 +8,6 @@ needs no account, no telemetry and no server.
 curl -fsSL https://raw.githubusercontent.com/Pensero/ai-usage/main/install.sh | sh
 ```
 
-Or install from a clone:
-
-```sh
-git clone https://github.com/Pensero/ai-usage ~/.ai-usage && ~/.ai-usage/install.sh
-```
-
 Run it inside a repository. It installs the hooks, asks to backfill your past commits, and asks
 to push the notes.
 
@@ -85,7 +79,9 @@ by model:
 
 ## Requirements
 
-`git` and `python3` 3.9 or later. No other dependencies.
+`git` and `python3` 3.9 or later. No other dependencies. macOS has both after
+`xcode-select --install`. You do not need to change your `PATH`: when `~/.local/bin` is not on it,
+the installer adds the git alias `ai-usage`.
 
 ## Development
 

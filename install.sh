@@ -28,9 +28,10 @@ chmod +x "$BIN_DIR/git-ai-usage.tmp"
 mv "$BIN_DIR/git-ai-usage.tmp" "$BIN_DIR/git-ai-usage"
 echo "Installed $BIN_DIR/git-ai-usage"
 
+# Not on PATH: a git alias makes `git ai-usage` work without a shell profile change.
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
-  *) echo "Add $BIN_DIR to your PATH to use 'git ai-usage'." ;;
+  *) git config --global alias.ai-usage "!cd \"\${GIT_PREFIX:-.}\" && '$BIN_DIR/git-ai-usage'" ;;
 esac
 
 if git rev-parse --git-dir >/dev/null 2>&1; then
