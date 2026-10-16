@@ -68,8 +68,10 @@ by model:
   A squash keeps the lines of all the squashed commits. An amend copy counts once.
 - **Sharing.** Git does not push notes by default. The `pre-push` hook pushes them after it
   merges the remote notes (`cat_sort_uniq`). To see the notes of other people: `git ai-usage fetch`.
-- **Cost** is the API price of the tokens, from the Claude Code model catalog. On a subscription
-  plan you pay a flat fee instead.
+- **Cost** is the API price of the tokens, from the
+  [Anthropic pricing page](https://platform.claude.com/docs/en/about-claude/pricing), per request (a
+  Haiku 5.5 request above 100K prompt tokens pays its higher rate). On a subscription plan you pay a
+  flat fee instead.
 
 ## Limits
 
