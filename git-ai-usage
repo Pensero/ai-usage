@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """git ai-usage: record local AI coding-agent usage per commit in git notes.
 
-Reads the Claude Code transcripts on this machine (~/.claude/projects/**/*.jsonl) and writes,
-for each of your commits, the tokens and the derived cost of the work done in the repository
-since your previous commit. The data goes to the notes ref refs/notes/ai-usage, so commit SHAs
-do not change and past commits can be backfilled.
+Reads the Claude Code transcripts (~/.claude/projects/**/*.jsonl) and the Codex rollout files
+(~/.codex/sessions/**/rollout-*.jsonl) on this machine and writes, for each of your commits, the
+tokens and the derived cost of the work done in the repository since your previous commit. The
+data goes to the notes ref refs/notes/ai-usage, so commit SHAs do not change and past commits can
+be backfilled.
 
 A commit gets the usage between your previous commit and its author date, from transcripts
 whose working directory is inside the repository (or one of its worktrees). Each usage record
 belongs to exactly one window, so no record is counted twice.
 
-Note format, one line per model (plus one line for edited lines):
+Note format, one line per tool and model (plus one line per tool for edited lines):
 
     claude-code model=claude-opus-4-1 in=1200 out=5400 cache_read=230000 cache_write=12000 cost_usd=1.8400 from=1791000000 to=1791003600
     claude-code added=120 deleted=14 from=1791000000 to=1791003600
+    codex model=gpt-5.6-sol in=3100 out=900 cache_read=410000 cache_write=0 cost_usd=0.1940 from=1791000000 to=1791003600
 
 Readers sum the numeric keys of the unique lines. The window (from, to) makes a line unique, so
 a note copied twice by an amend is counted once and a squash keeps the lines of both commits.
@@ -23,21 +25,26 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import functools
 import json
 import os
 import re
 import subprocess
 import sys
+import time
+import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 NOTES_REF = "refs/notes/ai-usage"
 REMOTE_COPY_REF = "refs/notes/ai-usage-remote"
-TOOL = "claude-code"
+CLAUDE_TOOL = "claude-code"
+CODEX_TOOL = "codex"
+TOOLS = (CLAUDE_TOOL, CODEX_TOOL)
 TOKEN_KEYS = ("in", "out", "cache_read", "cache_write")
 EDIT_KEYS = ("added", "deleted")
 # Not --all: the commits of refs/notes/* and refs/stash are yours too, and their times would
@@ -84,6 +91,76 @@ MODEL_TIERS = {
     "claude-3-5-haiku": "haiku_35",
     "claude-fable-5": "tier_10_50",
     "claude-mythos-5": "tier_10_50",
+}
+
+# Codex: OpenAI list prices in USD per 1,000,000 tokens, from https://developers.openai.com/api/docs/pricing
+# (read 2026-10-15, the same values as the Pensero seed). Per processing mode, then per model:
+# (input, cached input, cache write, output), then the long-context rates (None: one price for
+# every request size). A cache write with no price costs the input price. A mode with no price for
+# a model gives no cost: it does not fall back to Standard.
+CODEX_LONG_CONTEXT_TOKENS = 272_000
+CODEX_PRICES = {
+    "standard": {
+        "gpt-6-astra": ((10, 1, 12.5, 50), (20, 2, 25, 75)),
+        "gpt-6.1-sol": ((2, 0.1, 2.5, 10), (4, 0.2, 5, 15)),
+        "gpt-6-luna": ((0.1, 0.01, 0.125, 0.5), (0.2, 0.02, 0.25, 0.75)),
+        "gpt-6-sol": ((2, 0.2, 2.5, 10), (4, 0.4, 5, 15)),
+        "gpt-5.6-sol": ((4, 0.4, 5, 20), (8, 0.8, 10, 30)),
+        "gpt-5.6-terra": ((2, 0.2, 2.5, 12), (4, 0.4, 5, 18)),
+        "gpt-5.6-luna": ((0.2, 0.02, 0.25, 1.2), (0.4, 0.04, 0.5, 1.8)),
+        "gpt-5.3-codex": ((1.75, 0.175, None, 14), None),
+        "gpt-5.5": ((5, 0.5, None, 30), (10, 1, None, 45)),
+        "gpt-5.5-pro": ((30, None, None, 180), (60, None, None, 270)),
+        "gpt-5.4": ((2.5, 0.25, None, 15), (5, 0.5, None, 22.5)),
+        "gpt-5.4-mini": ((0.75, 0.075, None, 4.5), None),
+        "gpt-5.4-nano": ((0.2, 0.02, None, 1.25), None),
+        "gpt-5.4-pro": ((30, None, None, 180), (60, None, None, 270)),
+        "gpt-5.2": ((1.75, 0.175, None, 14), None),
+        "gpt-5.2-pro": ((21, None, None, 168), None),
+        "gpt-5.1": ((1.25, 0.125, None, 10), None),
+        "gpt-5": ((1.25, 0.125, None, 10), None),
+        "gpt-5-mini": ((0.25, 0.025, None, 2), None),
+    },
+    "flex": {
+        "gpt-6-astra": ((5, 0.5, 6.25, 25), (10, 1, 12.5, 37.5)),
+        "gpt-6.1-sol": ((1, 0.05, 1.25, 5), (2, 0.1, 2.5, 7.5)),
+        "gpt-6-luna": ((0.05, 0.005, 0.0625, 0.25), (0.1, 0.01, 0.125, 0.375)),
+        "gpt-6-sol": ((1, 0.1, 1.25, 5), (2, 0.2, 2.5, 7.5)),
+        "gpt-5.6-sol": ((2, 0.2, 2.5, 10), (4, 0.4, 5, 15)),
+        "gpt-5.6-terra": ((1, 0.1, 1.25, 6), (2, 0.2, 2.5, 9)),
+        "gpt-5.6-luna": ((0.1, 0.01, 0.125, 0.6), (0.2, 0.02, 0.25, 0.9)),
+        "gpt-5.5": ((2.5, 0.25, None, 15), (5, 0.5, None, 22.5)),
+        "gpt-5.5-pro": ((15, None, None, 90), None),
+        "gpt-5.4": ((1.25, 0.13, None, 7.5), (2.5, 0.25, None, 11.25)),
+        "gpt-5.4-mini": ((0.375, 0.0375, None, 2.25), None),
+        "gpt-5.4-nano": ((0.1, 0.01, None, 0.625), None),
+        "gpt-5.4-pro": ((15, None, None, 90), (30, None, None, 135)),
+        "gpt-5.2": ((0.875, 0.0875, None, 7), None),
+        "gpt-5.1": ((0.625, 0.0625, None, 5), None),
+        "gpt-5": ((0.625, 0.0625, None, 5), None),
+        "gpt-5-mini": ((0.125, 0.0125, None, 1), None),
+    },
+    "priority": {
+        "gpt-6-astra": ((20, 2, 25, 100), (40, 4, 50, 150)),
+        "gpt-6.1-sol": ((4, 0.2, 5, 20), (8, 0.4, 10, 30)),
+        "gpt-6-luna": ((0.2, 0.02, 0.25, 1), (0.4, 0.04, 0.5, 1.5)),
+        "gpt-6-sol": ((4, 0.4, 5, 20), (8, 0.8, 10, 30)),
+        "gpt-5.6-sol": ((8, 0.8, 10, 40), (16, 1.6, 20, 60)),
+        "gpt-5.6-terra": ((4, 0.4, 5, 24), (8, 0.8, 10, 36)),
+        "gpt-5.6-luna": ((0.4, 0.04, 0.5, 2.4), (0.8, 0.08, 1, 3.6)),
+        "gpt-5.3-codex": ((3.5, 0.35, None, 28), None),
+        "gpt-5.5": ((12.5, 1.25, None, 75), None),
+        "gpt-5.4": ((5, 0.5, None, 30), None),
+        "gpt-5.4-mini": ((1.5, 0.15, None, 9), None),
+        "gpt-5.2": ((3.5, 0.35, None, 28), None),
+        "gpt-5.1": ((2.5, 0.25, None, 20), None),
+        "gpt-5": ((2.5, 0.25, None, 20), None),
+        "gpt-5-mini": ((0.45, 0.045, None, 3.6), None),
+    },
+    "ultrafast": {
+        "gpt-6-astra": ((60, 6, 75, 300), (120, 12, 150, 450)),
+        "gpt-6.1-sol": ((12, 0.6, 15, 60), (24, 1.2, 30, 90)),
+    },
 }
 
 
@@ -221,6 +298,8 @@ class Call:
     model: str
     fast: bool
     tokens: dict
+    tool: str = CLAUDE_TOOL
+    tier: str = ""
 
 
 @dataclass
@@ -228,6 +307,7 @@ class Edit:
     when: float
     added: int
     deleted: int
+    tool: str = CLAUDE_TOOL
 
 
 def edited_lines(result: dict) -> tuple[int, int]:
@@ -312,15 +392,455 @@ def rates_for(model: str, fast: bool = False) -> dict | None:
 
 
 def cost_usd(call: Call) -> float:
-    rates = rates_for(call.model, call.fast)
+    return priced(call)[0]
+
+
+def priced(call: Call) -> tuple[float, str]:
+    """Cost of one call or response and where its rates came from. Long-context rates depend on
+    the prompt of one request, so never price a sum."""
+    rates, source = call_rates(call)
     if not rates:
-        return 0.0
+        return 0.0, source
     tokens = call.tokens
     written = tokens["cache_write"]
-    one_hour = min(tokens["cache_write_1h"], written)
-    per_million = one_hour * rates["cache_write_1h"] + (written - one_hour) * rates["cache_write"]
-    per_million += tokens["in"] * rates["input"] + tokens["out"] * rates["output"] + tokens["cache_read"] * rates["cache_read"]
-    return per_million / 1_000_000 + tokens["web_search"] * WEB_SEARCH_USD
+    long = rates.get("long")
+    if long and tokens["in"] + tokens["cache_read"] + written > long[0]:
+        rates = {**rates, **{key: value for key, value in long[1].items() if value is not None}}
+    input_rate = rates["input"]
+    write = input_rate if rates.get("cache_write") is None else rates["cache_write"]
+    write_1h = 2 * input_rate if rates.get("cache_write_1h") is None else rates["cache_write_1h"]
+    read = input_rate if rates.get("cache_read") is None else rates["cache_read"]
+    one_hour = min(tokens.get("cache_write_1h", 0), written)
+    per_million = (
+        tokens["in"] * input_rate
+        + tokens["cache_read"] * read
+        + (written - one_hour) * write
+        + one_hour * write_1h
+        + tokens["out"] * rates["output"]
+    )
+    return per_million / 1_000_000 + tokens.get("web_search", 0) * WEB_SEARCH_USD, source
+
+
+# --- Codex rollouts -------------------------------------------------------------
+
+
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+
+
+ROLLOUT_NAME = re.compile(r"^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(?P<thread>.+)\.jsonl$")
+
+
+def rollout_files() -> dict[str, Path]:
+    """Rollout files by thread id, oldest first. A file in both folders counts once, from sessions/."""
+    files: dict[str, Path] = {}
+    for folder in ("archived_sessions", "sessions"):
+        root = codex_home() / folder
+        if root.is_dir():
+            for path in root.rglob("rollout-*.jsonl"):
+                match = ROLLOUT_NAME.match(path.name)
+                files[match["thread"] if match else path.stem] = path
+    return dict(sorted(files.items(), key=lambda item: item[1].name))
+
+
+def codex_tier(value: object) -> str:
+    """The processing mode Codex asked for. Codex sends none for Standard and `priority` for Fast."""
+    tier = str(value or "").strip().lower()
+    if tier in ("", "default", "auto"):
+        return "standard"
+    return "priority" if tier == "fast" else tier
+
+
+def _dict(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def changed_lines(changes: object) -> tuple[int, int]:
+    """Lines added and deleted by one applied patch. A deleted file counts no lines: its patch lists none."""
+    added = deleted = 0
+    for change in changes.values() if isinstance(changes, dict) else []:
+        kind = change.get("type") if isinstance(change, dict) else None
+        if kind == "add":
+            added += len(str(change.get("content") or "").splitlines())
+        elif kind == "update":
+            in_hunk = False
+            for line in str(change.get("unified_diff") or "").splitlines():
+                if line.startswith("@@"):
+                    in_hunk = True
+                elif in_hunk and line.startswith("+"):
+                    added += 1
+                elif in_hunk and line.startswith("-"):
+                    deleted += 1
+    return added, deleted
+
+
+def applied_patch(payload: dict) -> tuple[str, object] | None:
+    """(id, changes) of a successful patch: a completed `FileChange` item, or a legacy `patch_apply_end`."""
+    if payload.get("type") == "item_completed":
+        item = _dict(payload.get("item"))
+        if item.get("type") == "FileChange" and str(item.get("status")).lower() == "completed":
+            return str(item.get("id") or ""), item.get("changes")
+    elif payload.get("type") == "patch_apply_end" and payload.get("success") is True:
+        return str(payload.get("call_id") or ""), payload.get("changes")
+    return None
+
+
+def token_count_key(origin: str, total: object, last: dict) -> str:
+    """Id of a legacy `token_count` response, which has no response id. A fork copies it with the
+    same running total, so the first thread of the fork chain (`origin`), the total and the
+    response's own usage together identify it. Without `origin`, two sessions that start the same
+    way would share an id."""
+    if not isinstance(total, dict) or not total:
+        return "token_count|"
+    return f"token_count|{origin}|{json.dumps(total, sort_keys=True)}|{json.dumps(last, sort_keys=True)}"
+
+
+@dataclass
+class _Thread:
+    """What one rollout file has said so far."""
+
+    thread: str
+    origin: str
+    cwd: str = ""
+    model: str = "unknown"
+    tier: str = ""
+    turn_has_records: bool = False
+    turn_legacy: list = field(default_factory=list)
+
+
+class CodexRollouts:
+    """Reads rollout files into calls and edits.
+
+    The parsing follows `otel_collector/codex_report.py` in Pensero/pensero, which matches the Codex
+    OTel export. Ids are kept across files, because a fork copies the records of its parent: the
+    parent is read first, so a copied record counts once even when only the fork changed.
+    """
+
+    def __init__(self, roots: list[str], files: dict[str, Path]) -> None:
+        self.roots = roots
+        self.files = files
+        self.done: set[str] = set()
+        self.origins: dict[str, str] = {}
+        self.seen: set[str] = set()
+        self.calls: list[Call] = []
+        self.edits: list[Edit] = []
+
+    def read(self, thread: str) -> None:
+        if thread in self.done or thread not in self.files:
+            return
+        self.done.add(thread)
+        state = _Thread(thread=thread, origin=thread)
+        self.origins[thread] = thread
+        try:
+            handle = self.files[thread].open(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        with handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                    if isinstance(record, dict):
+                        self._record(state, record)
+                except (ValueError, KeyError, TypeError, AttributeError):
+                    # An open session has a half-written last line.
+                    continue
+        self._end_turn(state)
+
+    def _end_turn(self, state: _Thread) -> None:
+        """A turn from before `token_usage_record` (or a file resumed by a newer Codex) carries the
+        per-response usage only in `token_count`. A turn with records counts the records alone."""
+        if not state.turn_has_records:
+            for key, when, cwd, model, tier, usage in state.turn_legacy:
+                if self._first(key):
+                    self._response(when, cwd, model, tier, usage)
+        state.turn_has_records = False
+        state.turn_legacy = []
+
+    def _record(self, state: _Thread, record: dict) -> None:
+        payload = _dict(record.get("payload"))
+        kind = record.get("type")
+        if kind == "session_meta":
+            if payload.get("forked_from_id"):
+                parent = str(payload["forked_from_id"])
+                self.read(parent)
+                state.origin = self.origins[state.thread] = self.origins.get(parent, parent)
+            state.cwd = str(payload.get("cwd") or state.cwd)
+            return
+        if kind == "turn_context":
+            self._end_turn(state)
+            state.cwd = str(payload.get("cwd") or state.cwd)
+            state.model = str(payload.get("model") or state.model)
+            return
+        when = parse_time(record["timestamp"])
+        if kind == "token_usage_record":
+            state.turn_has_records = True
+            if self._first(f"response|{payload.get('response_id') or ''}"):
+                self._response(when, state.cwd, state.model, state.tier, payload.get("usage"))
+        elif kind == "event_msg":
+            self._event(state, when, payload)
+
+    def _event(self, state: _Thread, when: float, payload: dict) -> None:
+        kind = payload.get("type")
+        if kind == "thread_settings_applied":
+            settings = _dict(payload.get("thread_settings"))
+            state.cwd = str(settings.get("cwd") or state.cwd)
+            state.model = str(settings.get("model") or state.model)
+            state.tier = str(settings.get("service_tier") or "")
+        elif kind == "token_count":
+            info = _dict(payload.get("info"))
+            total, last = info.get("total_token_usage"), info.get("last_token_usage")
+            # Codex sends the same count again when only the rate limits change: the key removes it.
+            if isinstance(last, dict):
+                key = token_count_key(state.origin, total, last)
+                state.turn_legacy.append((key, when, state.cwd, state.model, state.tier, last))
+        elif (patch := applied_patch(payload)) and self._first(f"patch|{patch[0]}") and inside(state.cwd, self.roots):
+            added, deleted = changed_lines(patch[1])
+            if added or deleted:
+                self.edits.append(Edit(when, added, deleted, CODEX_TOOL))
+
+    def _response(self, when: float, cwd: str, model: str, tier: str, usage: object) -> None:
+        usage = _dict(usage)
+
+        def count(key: str) -> int:
+            return int(usage.get(key) or 0)
+
+        out = count("output_tokens")
+        # A response with no output is the warmup at the start of a session: the OTel export leaves it out too.
+        if out <= 0 or not inside(cwd, self.roots):
+            return
+        cached, written = count("cached_input_tokens"), count("cache_write_input_tokens")
+        tokens = {
+            # Codex input includes the cached and cache-write tokens; `in` does not, as for Claude Code.
+            "in": max(count("input_tokens") - cached - written, 0),
+            "out": out,
+            "cache_read": cached,
+            "cache_write": written,
+            "cache_write_1h": 0,
+            "web_search": 0,
+        }
+        self.calls.append(Call(when, model, False, tokens, CODEX_TOOL, codex_tier(tier)))
+
+    def _first(self, key: str) -> bool:
+        """True the first time an id is seen. A record with no id always counts."""
+        if key.endswith("|"):
+            return True
+        if key in self.seen:
+            return False
+        self.seen.add(key)
+        return True
+
+
+def read_rollouts(roots: list[str], since: float | None = None) -> tuple[list[Call], list[Edit]]:
+    """All Codex usage recorded in the repository, from rollout files changed after `since`."""
+    files = rollout_files()
+    rollouts = CodexRollouts(roots, files)
+    for thread, path in files.items():
+        try:
+            if since is not None and path.stat().st_mtime < since:
+                continue
+        except OSError:
+            continue
+        rollouts.read(thread)
+    return rollouts.calls, rollouts.edits
+
+
+def codex_rates(model: str, tier: str) -> tuple | None:
+    prices = CODEX_PRICES.get(tier, {})
+    if model in prices:
+        return prices[model]
+    for key in sorted(prices, key=len, reverse=True):
+        if is_version_of(model, key):
+            return prices[key]
+    return None
+
+
+def is_version_of(model: str, key: str) -> bool:
+    """gpt-5.4 covers gpt-5.4-2026-03-05 but not gpt-5.4-mini's own key, nor gpt-5.5 for gpt-5."""
+    return model.startswith(key) and model[len(key):][:1] in ("", "-")
+
+
+def builtin_rates(call: Call) -> dict | None:
+    if call.tool != CODEX_TOOL:
+        rates = rates_for(call.model, call.fast)
+        return {**rates, "long": None} if rates else None
+    prices = codex_rates(call.model, call.tier)
+    if not prices:
+        return None
+
+    def as_rates(values: tuple) -> dict:
+        return {name: values[index] for index, name in enumerate(("input", "cache_read", "cache_write", "output"))}
+
+    short, long = prices
+    return {**as_rates(short), "long": [CODEX_LONG_CONTEXT_TOKENS, as_rates(long)] if long else None}
+
+
+def call_mode(call: Call) -> str:
+    if call.tool == CODEX_TOOL:
+        return call.tier or "standard"
+    return "fast" if call.fast else "standard"
+
+
+def call_rates(call: Call) -> tuple[dict | None, str]:
+    """The downloaded rates when the cache has this model and mode, else the built-in ones."""
+    remote = price_table(str(price_cache_path()), offline()).get(call.tool, {}).get(call_mode(call), {})
+    found = match_model(remote, call.model, prefix=call.tool == CODEX_TOOL) if call.model else None
+    if found:
+        return found, found["src"]
+    rates = builtin_rates(call)
+    return rates, "builtin" if rates else "none"
+
+
+def match_model(prices: dict, model: str, prefix: bool):
+    if model in prices:
+        return prices[model]
+    for key in sorted(prices, key=len, reverse=True):
+        if is_version_of(model, key) if prefix else key in model:
+            return prices[key]
+    return None
+
+
+# --- downloaded prices ----------------------------------------------------------
+# ccusage's approach: LiteLLM's table first, models.dev for the models and long-context rates that
+# LiteLLM lacks, then the built-in tables. Only `backfill` and `setup` download, at most once a day;
+# the post-commit hook only reads the cache, so a commit never waits on the network.
+
+LITELLM_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+MODELS_DEV_URL = "https://models.dev/api.json"
+PRICE_SOURCES = (("litellm", "GIT_AI_USAGE_LITELLM_URL", LITELLM_URL), ("models.dev", "GIT_AI_USAGE_MODELS_DEV_URL", MODELS_DEV_URL))
+PRICE_CACHE_SECONDS = 86_400
+PRICE_TIMEOUT_SECONDS = 5
+PROVIDER_TOOLS = {"openai": CODEX_TOOL, "anthropic": CLAUDE_TOOL}
+CODEX_MODE_SUFFIXES = {"standard": "", "flex": "_flex", "priority": "_priority", "ultrafast": "_ultrafast"}
+LITELLM_KEYS = (
+    ("input", "input_cost_per_token"),
+    ("output", "output_cost_per_token"),
+    ("cache_read", "cache_read_input_token_cost"),
+    ("cache_write", "cache_creation_input_token_cost"),
+)
+
+
+def offline() -> bool:
+    return os.environ.get("GIT_AI_USAGE_OFFLINE", "") not in ("", "0")
+
+
+def price_cache_path() -> Path:
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "git-ai-usage" / "prices.json"
+
+
+@functools.lru_cache(maxsize=None)
+def price_table(path: str, is_offline: bool) -> dict:
+    if is_offline:
+        return {}
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def per_million(entry: dict, key: str) -> float | None:
+    value = entry.get(key)
+    return None if value is None else round(float(value) * 1_000_000, 6)
+
+
+def litellm_rates(entry: dict, suffix: str) -> dict | None:
+    """USD per 1M tokens for one LiteLLM entry and mode. `*_above_<N>k_tokens` keys are the rates
+    of a request whose prompt is above N thousand tokens."""
+    rates = {name: per_million(entry, key + suffix) for name, key in LITELLM_KEYS}
+    if rates["input"] is None or rates["output"] is None:
+        return None
+    rates["cache_write_1h"] = None if suffix else per_million(entry, "cache_creation_input_token_cost_above_1hr")
+    rates["long"] = None
+    for key in entry:
+        match = re.fullmatch(r"input_cost_per_token_above_(\d+)k_tokens" + re.escape(suffix), key)
+        if match:
+            above = f"_above_{match.group(1)}k_tokens"
+            long = {name: per_million(entry, base + above + suffix) for name, base in LITELLM_KEYS}
+            long["cache_write_1h"] = None if suffix else per_million(entry, "cache_creation_input_token_cost_above_1hr" + above)
+            rates["long"] = [int(match.group(1)) * 1000, long]
+    return rates
+
+
+def models_dev_rates(cost: dict) -> dict | None:
+    if cost.get("input") is None or cost.get("output") is None:
+        return None
+    names = ("input", "output", "cache_read", "cache_write")
+    rates = {**{name: cost.get(name) for name in names}, "cache_write_1h": None, "long": None}
+    for tier in cost.get("tiers") or []:
+        if (tier.get("tier") or {}).get("type") == "context":
+            rates["long"] = [int(tier["tier"]["size"]), {name: tier.get(name) for name in names}]
+    return rates
+
+
+def scaled(rates: dict, factor: float) -> dict:
+    def scale(values: dict) -> dict:
+        return {key: None if value is None else value * factor for key, value in values.items() if key != "long"}
+
+    long = rates.get("long")
+    return {**scale(rates), "long": [long[0], scale(long[1])] if long else None}
+
+
+def build_price_table(litellm: dict | None, models_dev: dict | None) -> dict:
+    """{tool: {mode: {model: rates}}} from the two sources. Claude Fast mode is LiteLLM's
+    `provider_specific_entry.fast` multiplier on the standard rates; models.dev has no modes."""
+    table: dict = {tool: defaultdict(dict) for tool in TOOLS}
+    for model, entry in (litellm or {}).items():
+        tool = PROVIDER_TOOLS.get(entry.get("litellm_provider")) if isinstance(entry, dict) else None
+        if not tool:
+            continue
+        if tool == CODEX_TOOL:
+            modes = {mode: litellm_rates(entry, suffix) for mode, suffix in CODEX_MODE_SUFFIXES.items()}
+        else:
+            standard = litellm_rates(entry, "")
+            factor = (entry.get("provider_specific_entry") or {}).get("fast")
+            modes = {"standard": standard, "fast": scaled(standard, float(factor)) if standard and factor else None}
+        for mode, rates in modes.items():
+            if rates:
+                table[tool][mode][model] = {**rates, "src": "litellm"}
+    for provider, tool in PROVIDER_TOOLS.items():
+        for model, info in (((models_dev or {}).get(provider) or {}).get("models") or {}).items():
+            rates = models_dev_rates(info.get("cost") or {}) if isinstance(info, dict) else None
+            known = table[tool]["standard"].get(model)
+            if not rates:
+                continue
+            if not known:
+                table[tool]["standard"][model] = {**rates, "src": "models.dev"}
+            elif not known["long"] and rates["long"]:
+                known.update(long=rates["long"], src="litellm+models.dev")
+    return table
+
+
+def download_json(url: str) -> dict:
+    with urllib.request.urlopen(url, timeout=PRICE_TIMEOUT_SECONDS) as response:
+        return json.load(response)
+
+
+def refresh_prices() -> None:
+    """Download the price sources when the cache is a day old. A failure keeps the old cache, and
+    with no cache the built-in tables apply."""
+    path = price_cache_path()
+    if offline() or (path.exists() and time.time() - path.stat().st_mtime < PRICE_CACHE_SECONDS):
+        return
+    sources = {}
+    for name, variable, url in PRICE_SOURCES:
+        try:
+            sources[name] = download_json(os.environ.get(variable) or url)
+        except (OSError, ValueError) as error:
+            print(f"git ai-usage: could not download the {name} prices ({error}).", file=sys.stderr)
+    if not sources:
+        print("git ai-usage: using the cached or built-in prices.", file=sys.stderr)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_suffix(".tmp")
+    partial.write_text(json.dumps(build_price_table(sources.get("litellm"), sources.get("models.dev"))))
+    partial.replace(path)
+    price_table.cache_clear()
+
+
+def read_usage(roots: list[str], since: float | None = None) -> tuple[list[Call], list[Edit]]:
+    """The usage of every supported agent in the repository."""
+    calls, edits = read_transcripts(roots, since)
+    codex_calls, codex_edits = read_rollouts(roots, since)
+    return calls + codex_calls, edits + codex_edits
 
 
 # --- windows and notes ----------------------------------------------------------
@@ -334,25 +854,30 @@ def window_of(author_time: int, bounds: list[int]) -> tuple[int, int]:
 
 
 def note_for_window(start: int, end: int, calls: list[Call], edits: list[Edit]) -> str:
-    per_model: dict[str, dict] = defaultdict(lambda: {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0})
+    per_model: dict[tuple[str, str], dict] = defaultdict(
+        lambda: {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0, "src": set()}
+    )
     for call in calls:
         if start < call.when <= end:
-            total = per_model[call.model or "unknown"]
+            total = per_model[(call.tool, call.model or "unknown")]
             for key in TOKEN_KEYS:
                 total[key] += call.tokens[key]
-            total["cost"] += cost_usd(call)
-    added = sum(edit.added for edit in edits if start < edit.when <= end)
-    deleted = sum(edit.deleted for edit in edits if start < edit.when <= end)
+            cost, source = priced(call)
+            total["cost"] += cost
+            total["src"].update(source.split("+"))
     lines = []
     span = f"from={start} to={end}"
-    for model in sorted(per_model):
-        total = per_model[model]
-        if not any(total[key] for key in TOKEN_KEYS):
-            continue
-        counts = " ".join(f"{key}={total[key]}" for key in TOKEN_KEYS)
-        lines.append(f"{TOOL} model={model} {counts} cost_usd={total['cost']:.4f} {span}")
-    if added or deleted:
-        lines.append(f"{TOOL} added={added} deleted={deleted} {span}")
+    for tool in TOOLS:
+        for _, model in sorted(key for key in per_model if key[0] == tool):
+            total = per_model[(tool, model)]
+            if not any(total[key] for key in TOKEN_KEYS):
+                continue
+            counts = " ".join(f"{key}={total[key]}" for key in TOKEN_KEYS)
+            lines.append(f"{tool} model={model} {counts} cost_usd={total['cost']:.4f} price_src={'+'.join(sorted(total['src']))} {span}")
+        added = sum(edit.added for edit in edits if edit.tool == tool and start < edit.when <= end)
+        deleted = sum(edit.deleted for edit in edits if edit.tool == tool and start < edit.when <= end)
+        if added or deleted:
+            lines.append(f"{tool} added={added} deleted={deleted} {span}")
     return "".join(line + "\n" for line in lines)
 
 
@@ -360,9 +885,9 @@ def parse_note(text: str) -> list[dict]:
     entries = []
     for line in text.splitlines():
         parts = line.split()
-        if not parts or parts[0] != TOOL:
+        if not parts or parts[0] not in TOOLS:
             continue
-        entry = {"_line": line.strip()}
+        entry = {"_line": line.strip(), "_tool": parts[0]}
         for part in parts[1:]:
             key, _, value = part.partition("=")
             entry[key] = value
@@ -376,8 +901,10 @@ class Totals:
     cost: float = 0.0
     added: int = 0
     deleted: int = 0
+    tool: str = ""
 
     def add(self, entry: dict) -> None:
+        self.tool = entry.get("_tool", self.tool)
         for key in TOKEN_KEYS:
             self.tokens[key] += int(entry.get(key, 0) or 0)
         self.cost += float(entry.get("cost_usd", 0) or 0)
@@ -385,12 +912,12 @@ class Totals:
         self.deleted += int(entry.get("deleted", 0) or 0)
 
 
-def summarize(notes: list[tuple[Commit, str]]) -> tuple[list[tuple[Commit, Totals]], dict[str, Totals], Totals]:
-    """Per-commit and per-model totals. A line seen on two commits (a cherry-pick or a rebased
+def summarize(notes: list[tuple[Commit, str]]) -> tuple[list[tuple[Commit, Totals]], dict[tuple[str, str], Totals], Totals]:
+    """Per-commit and per-(tool, model) totals. A line seen on two commits (a cherry-pick or a rebased
     copy) counts once."""
     seen: set[str] = set()
     per_commit = []
-    per_model: dict[str, Totals] = defaultdict(Totals)
+    per_model: dict[tuple[str, str], Totals] = defaultdict(Totals)
     grand = Totals()
     for commit, note in notes:
         commit_total = Totals()
@@ -401,7 +928,7 @@ def summarize(notes: list[tuple[Commit, str]]) -> tuple[list[tuple[Commit, Total
             commit_total.add(entry)
             grand.add(entry)
             if "model" in entry:
-                per_model[entry["model"]].add(entry)
+                per_model[(entry["_tool"], entry["model"])].add(entry)
         per_commit.append((commit, commit_total))
     return per_commit, dict(per_model), grand
 
@@ -419,7 +946,7 @@ def backfill(email: str, force: bool = False, extra_paths: list[str] | None = No
     bounds = own_commit_times(email)
     if not bounds:
         return 0
-    calls, edits = read_transcripts(roots)
+    calls, edits = read_usage(roots)
     if not calls and not edits:
         return 0
     first_usage = min(item.when for item in [*calls, *edits])
@@ -452,7 +979,7 @@ def note_head() -> None:
         return
     bounds = own_commit_times(email)
     start, end = window_of(commit.author_time, bounds)
-    calls, edits = read_transcripts(repo_roots(), since=start or None)
+    calls, edits = read_usage(repo_roots(), since=start or None)
     text = note_for_window(start, end, calls, edits)
     if text:
         write_note(commit.sha, text)
@@ -489,7 +1016,9 @@ def show(revision: str | None, as_json: bool) -> None:
                 {"sha": c.sha, "subject": c.subject, **t.tokens, "cost_usd": round(t.cost, 4), "added": t.added, "deleted": t.deleted}
                 for c, t in per_commit
             ],
-            "models": {m: {**t.tokens, "cost_usd": round(t.cost, 4)} for m, t in per_model.items()},
+            "models": [
+                {"tool": tool, "model": model, **t.tokens, "cost_usd": round(t.cost, 4)} for (tool, model), t in sorted(per_model.items())
+            ],
             "total": {**grand.tokens, "cost_usd": round(grand.cost, 4), "added": grand.added, "deleted": grand.deleted},
         }, indent=2))
         return
@@ -509,8 +1038,8 @@ def show(revision: str | None, as_json: bool) -> None:
     )
     if per_model:
         print("\nby model:")
-        for model, total in sorted(per_model.items(), key=lambda item: -item[1].cost):
-            print(f"  {model:40} {total.cost:>8.2f} $  out={format_tokens(total.tokens['out'])}")
+        for (tool, model), total in sorted(per_model.items(), key=lambda item: -item[1].cost):
+            print(f"  {tool + ' ' + model:52} {total.cost:>8.2f} $  out={format_tokens(total.tokens['out'])}")
 
 
 def hook_block(name: str) -> str:
@@ -603,7 +1132,7 @@ def ask(question: str, default: bool = True) -> bool:
 def setup() -> None:
     install()
     email = user_email()
-    if ask(f"Backfill notes for your past commits ({email}) from the local Claude Code transcripts?"):
+    if ask(f"Backfill notes for your past commits ({email}) from the local Claude Code and Codex transcripts?"):
         written = backfill(email)
         print(f"Wrote {written} note{'' if written == 1 else 's'}.")
     remote = "origin" if git_ok("remote", "get-url", "origin") else None
@@ -617,6 +1146,7 @@ def setup() -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="git ai-usage", description="Record local AI coding-agent usage per commit in git notes.")
     parser.add_argument("--version", action="version", version=__version__)
+    parser.add_argument("--offline", action="store_true", help="never download prices; use the built-in ones (or GIT_AI_USAGE_OFFLINE=1)")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("setup", help="install the hooks, then offer to backfill and push")
     commands.add_parser("install", help="install the post-commit and pre-push hooks in this repository")
@@ -635,6 +1165,10 @@ def main(argv: list[str] | None = None) -> int:
     hook_parser.add_argument("name", choices=("post-commit", "pre-push"))
     hook_parser.add_argument("remote", nargs="?", default="origin")
     args = parser.parse_args(argv)
+    if args.offline:
+        os.environ["GIT_AI_USAGE_OFFLINE"] = "1"
+    if args.command in ("setup", "backfill"):
+        refresh_prices()
 
     try:
         if args.command == "hook":
