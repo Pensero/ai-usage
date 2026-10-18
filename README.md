@@ -54,12 +54,17 @@ by model:
   get notes. One line per tool and model, and one line per tool for edited lines:
 
   ```
-  claude-code model=claude-opus-4-1 in=1200 out=54000 cache_read=23000000 cache_write=410000 cost_usd=14.1200 price_src=litellm from=1791000000 to=1791003600
-  claude-code added=212 deleted=31 from=1791000000 to=1791003600
-  codex model=gpt-5.6-sol in=3100 out=900 cache_read=410000 cache_write=0 cost_usd=0.1940 price_src=litellm+models.dev from=1791000000 to=1791003600
+  claude-code model=claude-opus-4-1 in=1200 out=54000 cache_read=23000000 cache_write=410000 cost_usd=14.1200 price_src=litellm author=dev@example.com from=1791000000 to=1791003600
+  claude-code added=212 deleted=31 author=dev@example.com from=1791000000 to=1791003600
+  codex model=gpt-5.6-sol in=3100 out=900 cache_read=410000 cache_write=0 cost_usd=0.1940 price_src=litellm+models.dev author=dev@example.com from=1791000000 to=1791003600
   ```
 
-  To sum, add the numeric keys of the unique lines. `from`/`to` (Unix seconds) make a line unique.
+  To sum, add the numeric keys of the unique lines. A line is identified by its tool, its model
+  (none for edited lines) and `from`/`to` (Unix seconds). When two copies of a line exist (for
+  example after `backfill --force` and a notes merge), count one, preferably the one with `author`.
+  `author` is the commit author email, so a reader can attribute a note whose commit it cannot see
+  (a SHA that was rewritten before the push). To add it to older notes: `git ai-usage backfill --force`,
+  then `git ai-usage push`.
   `in` is the input that was not read from or written to the cache, for both tools.
 - **Rewrites.** `install` sets `notes.rewriteRef`, so notes follow `commit --amend` and `rebase`.
   A squash keeps the lines of all the squashed commits. An amend copy counts once.
