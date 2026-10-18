@@ -13,12 +13,15 @@ belongs to exactly one window, so no record is counted twice.
 
 Note format, one line per tool and model (plus one line per tool for edited lines):
 
-    claude-code model=claude-opus-4-1 in=1200 out=5400 cache_read=230000 cache_write=12000 cost_usd=1.8400 from=1791000000 to=1791003600
-    claude-code added=120 deleted=14 from=1791000000 to=1791003600
-    codex model=gpt-5.6-sol in=3100 out=900 cache_read=410000 cache_write=0 cost_usd=0.1940 from=1791000000 to=1791003600
+    claude-code model=claude-opus-4-1 in=1200 out=5400 cache_read=230000 cache_write=12000 cost_usd=1.8400 author=dev@example.com from=1791000000 to=1791003600
+    claude-code added=120 deleted=14 author=dev@example.com from=1791000000 to=1791003600
+    codex model=gpt-5.6-sol in=3100 out=900 cache_read=410000 cache_write=0 cost_usd=0.1940 author=dev@example.com from=1791000000 to=1791003600
 
-Readers sum the numeric keys of the unique lines. The window (from, to) makes a line unique, so
-a note copied twice by an amend is counted once and a squash keeps the lines of both commits.
+Readers sum the numeric keys of the unique lines. A line is identified by its tool, its model (or
+none, for edited lines) and its window (from, to), so a note copied twice by an amend is counted
+once, a squash keeps the lines of both commits, and a line rewritten by `backfill --force` (new
+prices, an author) replaces its older copy after a notes merge. `author` is the commit author
+email, so a reader can attribute a note whose commit it cannot see (an unpushed or rewritten SHA).
 """
 
 from __future__ import annotations
@@ -38,7 +41,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 NOTES_REF = "refs/notes/ai-usage"
 REMOTE_COPY_REF = "refs/notes/ai-usage-remote"
@@ -853,7 +856,7 @@ def window_of(author_time: int, bounds: list[int]) -> tuple[int, int]:
     return start, author_time
 
 
-def note_for_window(start: int, end: int, calls: list[Call], edits: list[Edit]) -> str:
+def note_for_window(start: int, end: int, calls: list[Call], edits: list[Edit], author: str = "") -> str:
     per_model: dict[tuple[str, str], dict] = defaultdict(
         lambda: {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0, "src": set()}
     )
@@ -866,7 +869,7 @@ def note_for_window(start: int, end: int, calls: list[Call], edits: list[Edit]) 
             total["cost"] += cost
             total["src"].update(source.split("+"))
     lines = []
-    span = f"from={start} to={end}"
+    span = f"author={author} from={start} to={end}" if author else f"from={start} to={end}"
     for tool in TOOLS:
         for _, model in sorted(key for key in per_model if key[0] == tool):
             total = per_model[(tool, model)]
@@ -891,6 +894,7 @@ def parse_note(text: str) -> list[dict]:
         for part in parts[1:]:
             key, _, value = part.partition("=")
             entry[key] = value
+        entry["_key"] = (entry["_tool"], entry.get("model"), entry.get("from"), entry.get("to"))
         entries.append(entry)
     return entries
 
@@ -914,22 +918,25 @@ class Totals:
 
 def summarize(notes: list[tuple[Commit, str]]) -> tuple[list[tuple[Commit, Totals]], dict[tuple[str, str], Totals], Totals]:
     """Per-commit and per-(tool, model) totals. A line seen on two commits (a cherry-pick or a rebased
-    copy) counts once."""
-    seen: set[str] = set()
-    per_commit = []
+    copy) counts once, on the first commit. Of two copies of a line, the one with an author wins."""
+    chosen: dict[tuple, dict] = {}
+    owner: dict[tuple, int] = {}
+    for index, (_, note) in enumerate(notes):
+        for entry in parse_note(note):
+            key = entry["_key"]
+            if key not in chosen:
+                chosen[key], owner[key] = entry, index
+            elif "author" in entry and "author" not in chosen[key]:
+                chosen[key] = entry
+    commit_totals = [Totals() for _ in notes]
     per_model: dict[tuple[str, str], Totals] = defaultdict(Totals)
     grand = Totals()
-    for commit, note in notes:
-        commit_total = Totals()
-        for entry in parse_note(note):
-            if entry["_line"] in seen:
-                continue
-            seen.add(entry["_line"])
-            commit_total.add(entry)
-            grand.add(entry)
-            if "model" in entry:
-                per_model[(entry["_tool"], entry["model"])].add(entry)
-        per_commit.append((commit, commit_total))
+    for key, entry in chosen.items():
+        commit_totals[owner[key]].add(entry)
+        grand.add(entry)
+        if "model" in entry:
+            per_model[(entry["_tool"], entry["model"])].add(entry)
+    per_commit = [(commit, total) for (commit, _), total in zip(notes, commit_totals)]
     return per_commit, dict(per_model), grand
 
 
@@ -957,7 +964,7 @@ def backfill(email: str, force: bool = False, extra_paths: list[str] | None = No
         if not force and read_note(commit.sha):
             continue
         start, end = window_of(commit.author_time, bounds)
-        text = note_for_window(start, end, calls, edits)
+        text = note_for_window(start, end, calls, edits, commit.email)
         if text:
             write_note(commit.sha, text)
             written += 1
@@ -980,7 +987,7 @@ def note_head() -> None:
     bounds = own_commit_times(email)
     start, end = window_of(commit.author_time, bounds)
     calls, edits = read_usage(repo_roots(), since=start or None)
-    text = note_for_window(start, end, calls, edits)
+    text = note_for_window(start, end, calls, edits, commit.email)
     if text:
         write_note(commit.sha, text)
 

@@ -194,6 +194,23 @@ class BackfillTest(Sandbox):
         # 10 input tokens at $15/M plus 1M output tokens at $75/M.
         self.assertAlmostEqual(float(self.note(sha)[0]["cost_usd"]), 75.00015, places=3)
 
+    def test_each_line_names_the_commit_author(self):
+        path = self.transcript()
+        self.commit(1)
+        self.call(path, T0 + 1500, out=100)
+        self.edit(path, T0 + 1600, lines=3)
+        sha = self.commit(2)
+        tool.backfill(EMAIL, quiet=True)
+        self.assertEqual([entry["author"] for entry in self.note(sha)], [EMAIL, EMAIL])
+
+    def test_a_rewritten_line_replaces_its_old_copy(self):
+        old = "claude-code model=m out=10 cost_usd=1.0000 from=1 to=2\nclaude-code added=4 deleted=0 from=1 to=2\n"
+        new = f"claude-code model=m out=10 cost_usd=1.5000 author={EMAIL} from=1 to=2\nclaude-code added=4 deleted=0 author={EMAIL} from=1 to=2\n"
+        _, per_model, total = tool.summarize([(None, old + new)])
+        self.assertEqual((total.tokens["out"], total.added), (10, 4))
+        self.assertAlmostEqual(total.cost, 1.5)
+        self.assertEqual(list(per_model), [("claude-code", "m")])
+
     def test_keeps_existing_notes_unless_forced(self):
         path = self.transcript()
         self.commit(1)
@@ -465,6 +482,26 @@ class RemoteTest(Sandbox):
         self.git("fetch", "-q", "origin", "main")
         tool.fetch("origin")
         self.assertEqual(tool.parse_note(tool.read_note(here))[0]["out"], "10")
+
+    def test_forced_backfill_after_a_push_counts_once(self):
+        remote = self.tmp / "remote.git"
+        self.git("init", "-q", "--bare", str(remote))
+        self.git("remote", "add", "origin", str(remote))
+        path = self.transcript()
+        self.commit(0)
+        self.call(path, T0 + 500, out=10)
+        sha = self.commit(1)
+        tool.write_note(sha, f"claude-code model=claude-opus-4-1 out=10 from={T0} to={T0 + 1000}\n")
+        self.git("push", "-q", "origin", "HEAD:main")
+        tool.push("origin")
+
+        self.git("update-ref", "-d", tool.NOTES_REF)
+        tool.backfill(EMAIL, quiet=True)
+        tool.push("origin")
+
+        self.assertEqual(len(self.note(sha)), 2)
+        _, _, total = self.totals(sha)
+        self.assertEqual(total.tokens["out"], 10)
 
 
 class PriceSourceTest(Sandbox):
