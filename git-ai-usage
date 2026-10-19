@@ -56,9 +56,17 @@ CODE_REFS = ("--branches", "--tags", "--remotes", "HEAD")
 HOOK_START = "# >>> git-ai-usage >>>"
 HOOK_END = "# <<< git-ai-usage <<<"
 
-# USD per 1,000,000 tokens, from the model catalog in the Claude Code binary. This is the
-# API-equivalent cost: a subscription plan pays a flat fee instead.
+# USD per 1,000,000 tokens, from https://platform.claude.com/docs/en/about-claude/pricing (read
+# 2026-10-16). This is the API-equivalent cost: a subscription plan pays a flat fee instead. Fast
+# mode keeps the prompt-caching multipliers of its model on top of the Fast input price.
 PRICING_TIERS = {
+    "tier_2_10": {"input": 2.0, "output": 10.0, "cache_write": 2.5, "cache_write_1h": 4.0, "cache_read": 0.2},
+    "sonnet_5_5": {"input": 2.0, "output": 10.0, "cache_write": 2.5, "cache_write_1h": 4.0, "cache_read": 0.1},
+    "opus_5_5": {"input": 4.0, "output": 20.0, "cache_write": 5.0, "cache_write_1h": 8.0, "cache_read": 0.2},
+    "fast_opus_5_5": {"input": 8.0, "output": 40.0, "cache_write": 10.0, "cache_write_1h": 16.0, "cache_read": 0.4},
+    "fable_5_1": {"input": 10.0, "output": 50.0, "cache_write": 12.5, "cache_write_1h": 20.0, "cache_read": 0.25},
+    "haiku_5_5": {"input": 0.1, "output": 0.5, "cache_write": 0.125, "cache_write_1h": 0.2, "cache_read": 0.01},
+    "haiku_5_5_long": {"input": 0.5, "output": 2.5, "cache_write": 0.625, "cache_write_1h": 1.0, "cache_read": 0.05},
     "tier_3_15": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_write_1h": 6.0, "cache_read": 0.3},
     "tier_5_25": {"input": 5.0, "output": 25.0, "cache_write": 6.25, "cache_write_1h": 10.0, "cache_read": 0.5},
     "tier_10_50": {"input": 10.0, "output": 50.0, "cache_write": 12.5, "cache_write_1h": 20.0, "cache_read": 1.0},
@@ -69,12 +77,14 @@ PRICING_TIERS = {
 }
 WEB_SEARCH_USD = 0.01
 FAST_MODE_TIERS = {
+    "claude-opus-5-5": "fast_opus_5_5",
     "claude-opus-5": "tier_10_50",
     "claude-opus-4-8": "tier_10_50",
     "claude-opus-4-7": "fast_30_150",
     "claude-opus-4-6": "fast_30_150",
 }
 MODEL_TIERS = {
+    "claude-opus-5-5": "opus_5_5",
     "claude-opus-5": "tier_5_25",
     "claude-opus-4-8": "tier_5_25",
     "claude-opus-4-7": "tier_5_25",
@@ -84,17 +94,23 @@ MODEL_TIERS = {
     "claude-opus-4-0": "tier_15_75",
     "claude-opus-4-20250514": "tier_15_75",
     "claude-sonnet-4-20250514": "tier_3_15",
-    "claude-sonnet-5": "tier_3_15",
+    "claude-sonnet-5-5": "sonnet_5_5",
+    "claude-sonnet-5": "tier_2_10",
     "claude-sonnet-4-6": "tier_3_15",
     "claude-sonnet-4-5": "tier_3_15",
     "claude-sonnet-4-0": "tier_3_15",
     "claude-3-7-sonnet": "tier_3_15",
     "claude-3-5-sonnet": "tier_3_15",
+    "claude-haiku-5-5": "haiku_5_5",
     "claude-haiku-4-5": "haiku_45",
     "claude-3-5-haiku": "haiku_35",
+    "claude-fable-5-1": "fable_5_1",
+    "claude-mythos-5-1": "fable_5_1",
     "claude-fable-5": "tier_10_50",
     "claude-mythos-5": "tier_10_50",
 }
+# A request whose prompt (input, cache reads and cache writes) is above the limit pays other rates.
+LONG_PROMPT_TIERS = {"haiku_5_5": (100_000, "haiku_5_5_long")}
 
 # Codex: OpenAI list prices in USD per 1,000,000 tokens, from https://developers.openai.com/api/docs/pricing
 # (read 2026-10-15, the same values as the Pensero seed). Per processing mode, then per model:
@@ -384,14 +400,23 @@ def _read_record(record: dict, roots: list[str], calls: dict, edits: dict) -> No
             edits[record["uuid"]] = Edit(when, added, deleted)
 
 
-def rates_for(model: str, fast: bool = False) -> dict | None:
+def tier_for(model: str, fast: bool = False) -> str | None:
     for table in ((FAST_MODE_TIERS if fast else {}), MODEL_TIERS):
         if model in table:
-            return PRICING_TIERS[table[model]]
+            return table[model]
         for key in sorted(table, key=len, reverse=True):
             if key in model:
-                return PRICING_TIERS[table[key]]
+                return table[key]
     return None
+
+
+def rates_for(model: str, fast: bool = False) -> dict | None:
+    """A tier's rates, with the higher ones a long prompt pays (Haiku 5.5 above 100K) under "long"."""
+    tier = tier_for(model, fast)
+    if tier is None:
+        return None
+    limit, long_tier = LONG_PROMPT_TIERS.get(tier, (None, None))
+    return {**PRICING_TIERS[tier], "long": [limit, PRICING_TIERS[long_tier]] if limit is not None else None}
 
 
 def cost_usd(call: Call) -> float:
@@ -664,8 +689,7 @@ def is_version_of(model: str, key: str) -> bool:
 
 def builtin_rates(call: Call) -> dict | None:
     if call.tool != CODEX_TOOL:
-        rates = rates_for(call.model, call.fast)
-        return {**rates, "long": None} if rates else None
+        return rates_for(call.model, call.fast)
     prices = codex_rates(call.model, call.tier)
     if not prices:
         return None

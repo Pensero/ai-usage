@@ -194,6 +194,30 @@ class BackfillTest(Sandbox):
         # 10 input tokens at $15/M plus 1M output tokens at $75/M.
         self.assertAlmostEqual(float(self.note(sha)[0]["cost_usd"]), 75.00015, places=3)
 
+    def test_cost_uses_the_published_rates(self):
+        # USD per 1M tokens from platform.claude.com/docs/en/about-claude/pricing:
+        # (input, 5m cache write, 1h cache write, cache hit, output).
+        cases = [
+            ("claude-sonnet-5", False, 0, (2, 2.5, 4, 0.2, 10)),
+            ("claude-sonnet-5-5", False, 0, (2, 2.5, 4, 0.1, 10)),
+            ("claude-opus-5-5", False, 0, (4, 5, 8, 0.2, 20)),
+            ("claude-opus-5-5", True, 0, (8, 10, 16, 0.4, 40)),
+            ("claude-opus-5", True, 0, (10, 12.5, 20, 1, 50)),
+            ("claude-fable-5-1", False, 0, (10, 12.5, 20, 0.25, 50)),
+            ("claude-mythos-5-1", False, 0, (10, 12.5, 20, 0.25, 50)),
+            ("claude-mythos-5", False, 0, (10, 12.5, 20, 1, 50)),
+            ("claude-haiku-5-5", False, 0, (0.1, 0.125, 0.2, 0.01, 0.5)),
+            # Haiku 5.5 above 100K prompt tokens, cache reads included: 1,000 + 99,500 + 2,000.
+            ("claude-haiku-5-5", False, 99_500, (0.5, 0.625, 1, 0.05, 2.5)),
+        ]
+        for model, fast, cached, (input_rate, write, write_1h, hit, output) in cases:
+            with self.subTest(model=model, fast=fast, cached=cached):
+                tokens = {"in": 1000, "out": 1000, "cache_read": cached or 1000, "cache_write": 2000,
+                          "cache_write_1h": 1000, "web_search": 0}
+                expected = (1000 * input_rate + 1000 * output + (cached or 1000) * hit + 1000 * write
+                            + 1000 * write_1h) / 1_000_000
+                self.assertAlmostEqual(tool.cost_usd(tool.Call(T0, model, fast, tokens)), expected, places=9)
+
     def test_each_line_names_the_commit_author(self):
         path = self.transcript()
         self.commit(1)

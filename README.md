@@ -70,13 +70,16 @@ by model:
   A squash keeps the lines of all the squashed commits. An amend copy counts once.
 - **Sharing.** Git does not push notes by default. The `pre-push` hook pushes them after it
   merges the remote notes (`cat_sort_uniq`). To see the notes of other people: `git ai-usage fetch`.
-- **Cost** is the API price of the tokens, per request or response. Codex gets the long-context
-  rate above 272K input tokens and the rate of the processing mode (Fast, Flex). On a subscription
-  plan (or a ChatGPT seat) you pay a flat fee instead.
+- **Cost** is the API price of the tokens, per request or response. A Claude Haiku 5.5 request
+  above 100K prompt tokens pays its higher rate. Codex gets the long-context rate above 272K input
+  tokens and the rate of the processing mode (Fast, Flex). On a subscription plan (or a ChatGPT
+  seat) you pay a flat fee instead.
 - **Prices** come from, in order:
   1. [LiteLLM's price table](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json).
   2. [models.dev](https://models.dev), for the models and long-context rates LiteLLM lacks.
-  3. The tables built into the script, from the Anthropic and OpenAI pricing pages.
+  3. The tables built into the script, from the
+     [Anthropic](https://platform.claude.com/docs/en/about-claude/pricing) and
+     [OpenAI](https://developers.openai.com/api/docs/pricing) pricing pages.
 
   `backfill` and `setup` download the first two at most once a day into
   `~/.cache/git-ai-usage/prices.json` (or `$XDG_CACHE_HOME`). The post-commit hook only reads that
