@@ -100,6 +100,26 @@ class Sandbox(unittest.TestCase):
         with path.open("a") as handle:
             handle.write(json.dumps(record) + "\n")
 
+    def commit_file(self, n: int, name: str, content: str, message: str = None) -> str:
+        """A commit at T0 + n * 1000 that writes `content` to `name`."""
+        stamp = f"@{T0 + n * 1000} +0000"
+        (self.repo / name).write_text(content)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message or f"commit {n}", env={"GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp})
+        return self.git("rev-parse", "HEAD").strip()
+
+    def patch(self, path: Path, when: float, name: str, added: list, deleted: list = ()):
+        """A Claude Code Edit result on `name` with a structured patch."""
+        self.messages += 1
+        lines = [f"+{line}" for line in added] + [f"-{line}" for line in deleted]
+        record = {"type": "user", "timestamp": iso(when), "cwd": str(self.repo), "uuid": f"e{self.messages}",
+                  "toolUseResult": {"filePath": str(self.repo / name), "structuredPatch": [{"lines": lines}]}}
+        with path.open("a") as handle:
+            handle.write(json.dumps(record) + "\n")
+
+    def edited(self, sha: str, tool_name: str = "claude-code") -> dict:
+        return next(entry for entry in self.note(sha) if entry["_tool"] == tool_name and "model" not in entry)
+
     def rollout(self, thread: str, cwd=None, model="gpt-5.6-sol", forked_from=None, folder="sessions") -> Path:
         path = self.home / ".codex" / folder / "2026" / "10" / "16" / f"rollout-2026-10-16T10-00-00-{thread}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -258,6 +278,37 @@ class BackfillTest(Sandbox):
         self.assertEqual(self.note(sha)[0]["out"], "100")
 
 
+    def test_committed_lines_follow_the_commit_that_holds_them(self):
+        path = self.transcript()
+        self.commit(1)
+        self.patch(path, T0 + 1500, "a.py", ["alpha = 1", "beta = 2"])
+        self.patch(path, T0 + 1600, "b.py", ["gamma = 3"], deleted=["old"])
+        second = self.commit_file(2, "a.py", "alpha = 1\nbeta = 2\n")
+        third = self.commit_file(3, "b.py", "gamma = 3\n")  # no edit in its window: the lines came earlier
+        self.git("checkout", "-q", "-b", "copy", "HEAD~1")
+        copy = self.commit_file(4, "b.py", "gamma = 3\n", message="copy of commit 3")
+
+        self.assertEqual(tool.backfill(EMAIL, quiet=True), 2)
+
+        self.assertEqual((self.edited(second)["added"], self.edited(second)["committed_added"]), ("3", "2"))
+        self.assertEqual((self.edited(third)["added"], self.edited(third)["committed_added"]), ("0", "1"))
+        self.assertEqual(self.edited(third)["committed_deleted"], "0")
+        self.assertEqual(tool.read_note(copy), "")  # the same lines again: not new work
+
+    def test_a_hand_changed_line_and_an_old_line_are_not_committed_lines(self):
+        path = self.transcript()
+        self.commit(1)
+        self.patch(path, T0 + 1500, "a.py", ["alpha = 1", "beta = 2"])
+        second = self.commit_file(2, "a.py", "alpha = 1\nbeta = 3\n")
+        self.patch(path, T0 + 2500 - tool.COMMITTED_LOOKBACK - 1, "c.py", ["too old"])
+        self.commit_file(3, "c.py", "too old\n")
+
+        tool.backfill(EMAIL, quiet=True)
+
+        self.assertEqual(self.edited(second)["committed_added"], "1")
+        self.assertEqual(tool.read_note(self.git("rev-parse", "HEAD").strip()), "")
+
+
 class CodexTest(Sandbox):
     def test_usage_and_patches_go_to_the_commit_window(self):
         path = self.rollout("t1")
@@ -408,11 +459,36 @@ class CodexTest(Sandbox):
         self.assertEqual(self.codex_note(sha)["gpt-5.6-sol"]["out"], "130")
 
 
+    def test_codex_committed_lines(self):
+        path = self.rollout("t1")
+        self.commit(1)
+        self.response(path, T0 + 1500, "r1", out=100)
+        patch = {"type": "item_completed", "item": {"type": "FileChange", "id": "p1", "status": "completed", "changes": {
+            str(self.repo / "a.py"): {"type": "add", "content": "a = 1\nb = 2\n"},
+            str(self.repo / "b.py"): {"type": "update", "unified_diff": "--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new\n"},
+        }}}
+        self.codex_line(path, T0 + 1600, "event_msg", patch)
+        second = self.commit_file(2, "a.py", "a = 1\nb = 2\nc = 3\n")
+
+        tool.backfill(EMAIL, quiet=True)
+
+        edited = self.edited(second, "codex")
+        self.assertEqual((edited["added"], edited["committed_added"], edited["committed_deleted"]), ("3", "2", "0"))
+
+
 class HookTest(Sandbox):
     def setUp(self):
         super().setUp()
         self.commit(0)
         tool.install()
+
+    def test_post_commit_writes_the_committed_lines(self):
+        path = self.transcript()
+        self.call(path, T0 + 500, out=33)
+        self.patch(path, T0 + 600, "a.py", ["alpha = 1", "beta = 2"])
+        sha = self.commit_file(1, "a.py", "alpha = 1\n")
+        edited = self.edited(sha)
+        self.assertEqual((edited["added"], edited["committed_added"]), ("2", "1"))
 
     def test_post_commit_writes_the_note(self):
         path = self.transcript()

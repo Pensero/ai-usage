@@ -48,6 +48,13 @@ by model:
 - **Window.** A commit gets the usage recorded between your previous commit and its author date.
   Only your commits (`user.email`) are bounds, and every usage record goes to exactly one commit.
   Usage that you did not commit goes to your next commit in that repository.
+- **Committed lines.** `added`/`deleted` are the lines the agent edited in the window, whatever
+  the commit holds. `committed_added`/`committed_deleted` are the lines of this commit's own diff
+  that the agent wrote in the 14 days before it (same file path, same text without surrounding
+  whitespace). A line that one of your earlier commits of those 14 days already added does not
+  count again, so a squash on main, a cherry-pick or a revert of a revert gets 0. Use the
+  committed pair for the AI share of a commit or a pull request, and the edited pair for effort.
+  An agent line that you changed by hand before the commit is not in the committed pair.
 - **Repository match.** A usage record counts when its working directory is inside the repository
   or one of its worktrees. For Codex, that is the `cwd` of the turn in the rollout file.
 - **Storage.** Git notes in `refs/notes/ai-usage`. Commit SHAs do not change, so past commits can
@@ -55,7 +62,7 @@ by model:
 
   ```
   claude-code model=claude-opus-4-1 in=1200 out=54000 cache_read=23000000 cache_write=410000 cost_usd=14.1200 price_src=litellm author=dev@example.com from=1791000000 to=1791003600
-  claude-code added=212 deleted=31 author=dev@example.com from=1791000000 to=1791003600
+  claude-code added=212 deleted=31 committed_added=180 committed_deleted=31 author=dev@example.com from=1791000000 to=1791003600
   codex model=gpt-5.6-sol in=3100 out=900 cache_read=410000 cache_write=0 cost_usd=0.1940 price_src=litellm+models.dev author=dev@example.com from=1791000000 to=1791003600
   ```
 
