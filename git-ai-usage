@@ -36,7 +36,7 @@ import subprocess
 import sys
 import time
 import urllib.request
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,6 +49,8 @@ CLAUDE_TOOL = "claude-code"
 CODEX_TOOL = "codex"
 TOOLS = (CLAUDE_TOOL, CODEX_TOOL)
 TOKEN_KEYS = ("in", "out", "cache_read", "cache_write")
+# A commit can hold lines the agent wrote this long before it.
+COMMITTED_LOOKBACK = 14 * 86400
 EDIT_KEYS = ("added", "deleted")
 # Not --all: the commits of refs/notes/* and refs/stash are yours too, and their times would
 # split the windows.
@@ -245,9 +247,14 @@ def list_commits(*rev_args: str) -> list[Commit]:
     return commits
 
 
-def own_commit_times(email: str) -> list[int]:
+def own_commits(email: str, commits: list[Commit] | None = None) -> list[Commit]:
+    commits = list_commits(*CODE_REFS) if commits is None else commits
+    return [commit for commit in commits if commit.email.lower() == email.lower()]
+
+
+def own_commit_times(email: str, commits: list[Commit] | None = None) -> list[int]:
     """Sorted unique author times of your commits. They are the window bounds."""
-    return sorted({commit.author_time for commit in list_commits(*CODE_REFS) if commit.email.lower() == email.lower()})
+    return sorted({commit.author_time for commit in own_commits(email, commits)})
 
 
 def read_note(sha: str) -> str:
@@ -327,6 +334,8 @@ class Edit:
     added: int
     deleted: int
     tool: str = CLAUDE_TOOL
+    # The non-blank text of the lines, by file path: {path: (added lines, deleted lines)}.
+    texts: dict = field(default_factory=dict)
 
 
 def edited_lines(result: dict) -> tuple[int, int]:
@@ -338,6 +347,27 @@ def edited_lines(result: dict) -> tuple[int, int]:
     if result.get("type") == "create":
         added += len((result.get("content") or "").split("\n"))
     return added, deleted
+
+
+def _texts(lines: list) -> list[str]:
+    return [text for text in (str(line).strip() for line in lines) if text]
+
+
+def edit_texts(result: dict) -> dict:
+    """The lines of one Claude Code edit, by file path."""
+    path = str(result.get("filePath") or "")
+    if not path:
+        return {}
+    added, deleted = [], []
+    for hunk in result.get("structuredPatch") or []:
+        for line in hunk.get("lines", []):
+            if line.startswith("+"):
+                added.append(line[1:])
+            elif line.startswith("-"):
+                deleted.append(line[1:])
+    if result.get("type") == "create":
+        added += (result.get("content") or "").split("\n")
+    return {path: (_texts(added), _texts(deleted))}
 
 
 def read_transcripts(roots: list[str], since: float | None = None) -> tuple[list[Call], list[Edit]]:
@@ -397,7 +427,7 @@ def _read_record(record: dict, roots: list[str], calls: dict, edits: dict) -> No
     if isinstance(result, dict) and record.get("uuid"):
         added, deleted = edited_lines(result)
         if added or deleted:
-            edits[record["uuid"]] = Edit(when, added, deleted)
+            edits[record["uuid"]] = Edit(when, added, deleted, texts=edit_texts(result))
 
 
 def tier_for(model: str, fast: bool = False) -> str | None:
@@ -500,6 +530,28 @@ def changed_lines(changes: object) -> tuple[int, int]:
                 elif in_hunk and line.startswith("-"):
                     deleted += 1
     return added, deleted
+
+
+def changed_texts(changes: object) -> dict:
+    """The lines of one applied Codex patch, by file path."""
+    texts = {}
+    for path, change in (changes.items() if isinstance(changes, dict) else []):
+        kind = change.get("type") if isinstance(change, dict) else None
+        added, deleted = [], []
+        if kind == "add":
+            added = str(change.get("content") or "").splitlines()
+        elif kind == "update":
+            in_hunk = False
+            for line in str(change.get("unified_diff") or "").splitlines():
+                if line.startswith("@@"):
+                    in_hunk = True
+                elif in_hunk and line.startswith("+"):
+                    added.append(line[1:])
+                elif in_hunk and line.startswith("-"):
+                    deleted.append(line[1:])
+        if added or deleted:
+            texts[str(path)] = (_texts(added), _texts(deleted))
+    return texts
 
 
 def applied_patch(payload: dict) -> tuple[str, object] | None:
@@ -624,7 +676,7 @@ class CodexRollouts:
         elif (patch := applied_patch(payload)) and self._first(f"patch|{patch[0]}") and inside(state.cwd, self.roots):
             added, deleted = changed_lines(patch[1])
             if added or deleted:
-                self.edits.append(Edit(when, added, deleted, CODEX_TOOL))
+                self.edits.append(Edit(when, added, deleted, CODEX_TOOL, texts=changed_texts(patch[1])))
 
     def _response(self, when: float, cwd: str, model: str, tier: str, usage: object) -> None:
         usage = _dict(usage)
@@ -880,7 +932,73 @@ def window_of(author_time: int, bounds: list[int]) -> tuple[int, int]:
     return start, author_time
 
 
-def note_for_window(start: int, end: int, calls: list[Call], edits: list[Edit], author: str = "") -> str:
+def relative_path(path: str, roots: list[str]) -> str:
+    real = os.path.realpath(path)
+    for root in roots:
+        root = root.rstrip("/")
+        if real.startswith(root + "/"):
+            return real[len(root) + 1 :]
+    return os.path.basename(real)
+
+
+def diff_lines(sha: str, cache: dict) -> tuple[Counter, Counter]:
+    """(added, deleted) non-blank lines of the diff of one commit, as (path, text) counters."""
+    if sha not in cache:
+        added: Counter = Counter()
+        deleted: Counter = Counter()
+        path = ""
+        for line in git("show", "--format=", "--unified=0", "--no-color", "--no-notes", sha, check=False).splitlines():
+            if line.startswith("+++ "):
+                path = line[6:] if line.startswith("+++ b/") else line[4:]
+            elif line.startswith("+") and line[1:].strip():
+                added[(path, line[1:].strip())] += 1
+            elif line.startswith("-") and not line.startswith("---") and line[1:].strip():
+                deleted[(path, line[1:].strip())] += 1
+        cache[sha] = (added, deleted)
+    return cache[sha]
+
+
+def committed_lines(commit: Commit, edits: list[Edit], roots: list[str], mine: list[Commit], cache: dict) -> dict:
+    """{tool: (added, deleted)}: the lines of this commit that the tool wrote in the COMMITTED_LOOKBACK before it.
+
+    A line is the same when its file path and its stripped text are equal. A line that one of your
+    earlier commits of the lookback already added is not new work of this commit (a squash, a
+    cherry-pick, a revert of a revert), so it does not count again.
+    """
+    added, deleted = diff_lines(commit.sha, cache)
+    if not added and not deleted:
+        return {}
+    since = commit.author_time - COMMITTED_LOOKBACK
+    earlier_added: Counter = Counter()
+    earlier_deleted: Counter = Counter()
+    for other in mine:
+        if since < other.author_time < commit.author_time:
+            other_added, other_deleted = diff_lines(other.sha, cache)
+            earlier_added.update(other_added)
+            earlier_deleted.update(other_deleted)
+    result = {}
+    for tool in TOOLS:
+        pool_added: Counter = Counter()
+        pool_deleted: Counter = Counter()
+        for edit in edits:
+            if edit.tool != tool or not since < edit.when <= commit.author_time:
+                continue
+            for path, (plus, minus) in edit.texts.items():
+                relative = relative_path(path, roots)
+                pool_added.update((relative, text) for text in plus)
+                pool_deleted.update((relative, text) for text in minus)
+        counts = (
+            sum((added & (pool_added - earlier_added)).values()),
+            sum((deleted & (pool_deleted - earlier_deleted)).values()),
+        )
+        if any(counts):
+            result[tool] = counts
+    return result
+
+
+def note_for_window(
+    start: int, end: int, calls: list[Call], edits: list[Edit], author: str = "", committed: dict | None = None
+) -> str:
     per_model: dict[tuple[str, str], dict] = defaultdict(
         lambda: {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0, "src": set()}
     )
@@ -903,8 +1021,12 @@ def note_for_window(start: int, end: int, calls: list[Call], edits: list[Edit], 
             lines.append(f"{tool} model={model} {counts} cost_usd={total['cost']:.4f} price_src={'+'.join(sorted(total['src']))} {span}")
         added = sum(edit.added for edit in edits if edit.tool == tool and start < edit.when <= end)
         deleted = sum(edit.deleted for edit in edits if edit.tool == tool and start < edit.when <= end)
-        if added or deleted:
-            lines.append(f"{tool} added={added} deleted={deleted} {span}")
+        committed_added, committed_deleted = (committed or {}).get(tool, (0, 0))
+        if added or deleted or committed_added or committed_deleted:
+            lines.append(
+                f"{tool} added={added} deleted={deleted} "
+                f"committed_added={committed_added} committed_deleted={committed_deleted} {span}"
+            )
     return "".join(line + "\n" for line in lines)
 
 
@@ -929,6 +1051,8 @@ class Totals:
     cost: float = 0.0
     added: int = 0
     deleted: int = 0
+    committed_added: int = 0
+    committed_deleted: int = 0
     tool: str = ""
 
     def add(self, entry: dict) -> None:
@@ -938,6 +1062,8 @@ class Totals:
         self.cost += float(entry.get("cost_usd", 0) or 0)
         self.added += int(entry.get("added", 0) or 0)
         self.deleted += int(entry.get("deleted", 0) or 0)
+        self.committed_added += int(entry.get("committed_added", 0) or 0)
+        self.committed_deleted += int(entry.get("committed_deleted", 0) or 0)
 
 
 def summarize(notes: list[tuple[Commit, str]]) -> tuple[list[tuple[Commit, Totals]], dict[tuple[str, str], Totals], Totals]:
@@ -974,7 +1100,9 @@ def in_rebase() -> bool:
 def backfill(email: str, force: bool = False, extra_paths: list[str] | None = None, quiet: bool = False) -> int:
     """Write notes for your commits that have none. Returns the number of notes written."""
     roots = repo_roots() + [os.path.realpath(path) for path in extra_paths or []]
-    bounds = own_commit_times(email)
+    commits = list_commits(*CODE_REFS)
+    mine = own_commits(email, commits)
+    bounds = own_commit_times(email, commits)
     if not bounds:
         return 0
     calls, edits = read_usage(roots)
@@ -982,13 +1110,15 @@ def backfill(email: str, force: bool = False, extra_paths: list[str] | None = No
         return 0
     first_usage = min(item.when for item in [*calls, *edits])
     written = 0
-    for commit in list_commits(*CODE_REFS):
+    diffs: dict = {}
+    for commit in commits:
         if commit.email.lower() != email.lower() or commit.author_time < first_usage:
             continue
         if not force and read_note(commit.sha):
             continue
         start, end = window_of(commit.author_time, bounds)
-        text = note_for_window(start, end, calls, edits, commit.email)
+        committed = committed_lines(commit, edits, roots, mine, diffs)
+        text = note_for_window(start, end, calls, edits, commit.email, committed)
         if text:
             write_note(commit.sha, text)
             written += 1
@@ -1008,10 +1138,13 @@ def note_head() -> None:
     email = user_email()
     if commit.email.lower() != email.lower():
         return
-    bounds = own_commit_times(email)
+    mine = own_commits(email)
+    bounds = own_commit_times(email, mine)
     start, end = window_of(commit.author_time, bounds)
-    calls, edits = read_usage(repo_roots(), since=start or None)
-    text = note_for_window(start, end, calls, edits, commit.email)
+    roots = repo_roots()
+    calls, edits = read_usage(roots, since=min(start, commit.author_time - COMMITTED_LOOKBACK) or None)
+    committed = committed_lines(commit, edits, roots, mine, {})
+    text = note_for_window(start, end, calls, edits, commit.email, committed)
     if text:
         write_note(commit.sha, text)
 
@@ -1044,13 +1177,15 @@ def show(revision: str | None, as_json: bool) -> None:
         print(json.dumps({
             "range": revision,
             "commits": [
-                {"sha": c.sha, "subject": c.subject, **t.tokens, "cost_usd": round(t.cost, 4), "added": t.added, "deleted": t.deleted}
+                {"sha": c.sha, "subject": c.subject, **t.tokens, "cost_usd": round(t.cost, 4), "added": t.added, "deleted": t.deleted,
+                 "committed_added": t.committed_added, "committed_deleted": t.committed_deleted}
                 for c, t in per_commit
             ],
             "models": [
                 {"tool": tool, "model": model, **t.tokens, "cost_usd": round(t.cost, 4)} for (tool, model), t in sorted(per_model.items())
             ],
-            "total": {**grand.tokens, "cost_usd": round(grand.cost, 4), "added": grand.added, "deleted": grand.deleted},
+            "total": {**grand.tokens, "cost_usd": round(grand.cost, 4), "added": grand.added, "deleted": grand.deleted,
+                      "committed_added": grand.committed_added, "committed_deleted": grand.committed_deleted},
         }, indent=2))
         return
     header = f"{'commit':10}  {'in':>7} {'out':>7} {'c.read':>7} {'c.write':>7} {'cost $':>8} {'+lines':>7} {'-lines':>7}  subject"
