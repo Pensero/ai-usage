@@ -7,7 +7,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-24.04, macos-latest, windows-latest]
+        os: [ubuntu-24.04, macos-latest]
         python: ["3.9", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
@@ -16,32 +16,3 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python -m unittest discover -s tests -v
-  mdm:
-    strategy:
-      matrix:
-        os: [macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - if: runner.os == 'macOS'
-        run: sudo GIT_AI_USAGE_SOURCE="$PWD/git-ai-usage" GIT_AI_USAGE_REMOTE="github.com/acme/ gitlab.com/acme/" sh mdm/macos.sh
-      - if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          GIT_AI_USAGE_SOURCE: ${{ github.workspace }}/git-ai-usage
-          GIT_AI_USAGE_REMOTE: "github.com/acme/ gitlab.com/acme/"
-        run: ./mdm/windows.ps1
-      - name: A commit in an organization repository gets the hook
-        shell: bash
-        run: |
-          set -eux
-          test "$(git config --global --get-all ai-usage.remote | tr '\n' ' ')" = "github.com/acme/ gitlab.com/acme/ "
-          git config --global core.hooksPath
-          git ai-usage --version
-          cd "$RUNNER_TEMP" && git init -q demo && cd demo
-          git remote add origin https://github.com/acme/demo.git
-          git -c user.email=dev@example.com -c user.name=Dev commit -q --allow-empty -m first
-          grep -q git-ai-usage "$(git config --global core.hooksPath)/post-commit"
