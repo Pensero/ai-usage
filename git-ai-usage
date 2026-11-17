@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 NOTES_REF = "refs/notes/ai-usage"
 REMOTE_COPY_REF = "refs/notes/ai-usage-remote"
@@ -57,6 +57,16 @@ EDIT_KEYS = ("added", "deleted")
 CODE_REFS = ("--branches", "--tags", "--remotes", "HEAD")
 HOOK_START = "# >>> git-ai-usage >>>"
 HOOK_END = "# <<< git-ai-usage <<<"
+OUR_HOOKS = ("post-commit", "pre-push")
+# The global hooks folder replaces .git/hooks in every repository, so it has a shim for each
+# client hook that runs the hook of the repository. ponytail: reference-transaction and
+# post-index-change get no shim, because git starts them on each ref or index update.
+CLIENT_HOOKS = (
+    "applypatch-msg", "pre-applypatch", "post-applypatch", "pre-commit", "pre-merge-commit",
+    "prepare-commit-msg", "commit-msg", "post-commit", "pre-rebase", "post-checkout", "post-merge",
+    "pre-push", "pre-auto-gc", "post-rewrite", "sendemail-validate", "push-to-checkout",
+)
+REMOTE_KEY = "ai-usage.remote"
 
 # USD per 1,000,000 tokens, from https://platform.claude.com/docs/en/about-claude/pricing (read
 # 2026-10-16). This is the API-equivalent cost: a subscription plan pays a flat fee instead. Fast
@@ -195,17 +205,11 @@ class UsageError(RuntimeError):
 def git(*args: str, check: bool = True, stdin: str | None = None) -> str:
     """Run git and return its stdout. The output is not stripped: callers use control-character
     separators, and str.strip() removes them as whitespace."""
-    result = subprocess.run(
-        ["git", *args],
-        input=stdin,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    # Bytes, not text mode: on Windows, text mode writes "\r\n" into the note.
+    result = subprocess.run(["git", *args], input=None if stdin is None else stdin.encode("utf-8"), capture_output=True)
     if check and result.returncode != 0:
-        raise UsageError(f"git {' '.join(args)}: {result.stderr.strip()}")
-    return result.stdout
+        raise UsageError(f"git {' '.join(args)}: {result.stderr.decode('utf-8', 'replace').strip()}")
+    return result.stdout.decode("utf-8", "replace")
 
 
 def git_ok(*args: str) -> bool:
@@ -217,7 +221,12 @@ def repo_roots() -> list[str]:
     roots = [line[len("worktree ") :] for line in git("worktree", "list", "--porcelain").splitlines() if line.startswith("worktree ")]
     if not roots:
         roots = [git("rev-parse", "--show-toplevel").rstrip("\n")]
-    return [os.path.realpath(root) for root in roots]
+    return [real(root) for root in roots]
+
+
+def real(path: str) -> str:
+    """The resolved path, with the case and separators of the platform (Windows: "c:\\repo")."""
+    return os.path.normcase(os.path.realpath(path))
 
 
 def user_email() -> str:
@@ -307,8 +316,8 @@ def project_dirs(roots: list[str]) -> list[Path]:
 def inside(cwd: str, roots: list[str]) -> bool:
     if not cwd:
         return False
-    path = os.path.realpath(cwd)
-    return any(path == root or path.startswith(root.rstrip("/") + "/") for root in roots)
+    path = real(cwd)
+    return any(path == root or path.startswith(root.rstrip(os.sep) + os.sep) for root in roots)
 
 
 def parse_time(value: str) -> float:
@@ -933,12 +942,13 @@ def window_of(author_time: int, bounds: list[int]) -> tuple[int, int]:
 
 
 def relative_path(path: str, roots: list[str]) -> str:
-    real = os.path.realpath(path)
+    """The path inside the repository, with "/" as git writes it."""
+    resolved = os.path.realpath(path)
     for root in roots:
-        root = root.rstrip("/")
-        if real.startswith(root + "/"):
-            return real[len(root) + 1 :]
-    return os.path.basename(real)
+        root = root.rstrip(os.sep)
+        if os.path.normcase(resolved).startswith(root + os.sep):
+            return resolved[len(root) + 1 :].replace(os.sep, "/")
+    return os.path.basename(resolved)
 
 
 def diff_lines(sha: str, cache: dict) -> tuple[Counter, Counter]:
@@ -1099,7 +1109,7 @@ def in_rebase() -> bool:
 
 def backfill(email: str, force: bool = False, extra_paths: list[str] | None = None, quiet: bool = False) -> int:
     """Write notes for your commits that have none. Returns the number of notes written."""
-    roots = repo_roots() + [os.path.realpath(path) for path in extra_paths or []]
+    roots = repo_roots() + [real(path) for path in extra_paths or []]
     commits = list_commits(*CODE_REFS)
     mine = own_commits(email, commits)
     bounds = own_commit_times(email, commits)
@@ -1209,12 +1219,28 @@ def show(revision: str | None, as_json: bool) -> None:
 
 
 def hook_block(name: str) -> str:
-    script = os.path.realpath(__file__)
+    script = Path(os.path.realpath(__file__)).as_posix()
     args = ' "$1"' if name == "pre-push" else ""
+    # Windows has no python3 for the shebang, so the hook names the interpreter.
+    command = f"'{Path(sys.executable).as_posix()}' '{script}'" if os.name == "nt" else f"'{script}'"
     return (
         f"{HOOK_START}\n"
-        f"[ -x '{script}' ] && '{script}' hook {name}{args} </dev/null >/dev/null 2>&1 || true\n"
+        f"[ -f '{script}' ] && {command} hook {name}{args} </dev/null >/dev/null 2>&1 || true\n"
         f"{HOOK_END}\n"
+    )
+
+
+def write_hook(path: Path, content: str) -> None:
+    # Bytes: the shell of Git for Windows fails on "\r\n".
+    path.write_bytes(content.encode("utf-8"))
+    path.chmod(path.stat().st_mode | 0o111)
+
+
+def chain(name: str) -> str:
+    """Run the hook of the repository after ours, because core.hooksPath hides .git/hooks."""
+    return (
+        f'h="$(git rev-parse --git-common-dir)/hooks/{name}"\n'
+        f'if [ -x "$h" ]; then exec "$h" "$@"; fi\n'
     )
 
 
@@ -1232,39 +1258,97 @@ def install_hook(hooks_dir: Path, name: str) -> None:
             content = f"{first}\n{block}{rest}" if first.startswith("#!") else f"#!/bin/sh\n{block}{content}"
     else:
         content = f"#!/bin/sh\n{block}"
-    path.write_text(content)
-    path.chmod(path.stat().st_mode | 0o111)
+    write_hook(path, content)
 
 
-def add_config(key: str, value: str) -> None:
-    if value not in git("config", "--get-all", key, check=False).splitlines():
-        git("config", "--add", key, value)
+def add_config(key: str, value: str, scope: tuple[str, ...] = ()) -> None:
+    if value not in git("config", *scope, "--get-all", key, check=False).splitlines():
+        git("config", *scope, "--add", key, value)
 
 
-def install() -> None:
-    hooks_dir = Path(git("rev-parse", "--git-path", "hooks").rstrip("\n"))
-    hooks_dir.mkdir(parents=True, exist_ok=True)
-    install_hook(hooks_dir, "post-commit")
-    install_hook(hooks_dir, "pre-push")
+def own_global_hooks_dir() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "git-ai-usage" / "hooks"
+
+
+def global_hooks_dir() -> Path:
+    """The global core.hooksPath if one is set, else our own folder."""
+    configured = git("config", "--global", "core.hooksPath", check=False).strip()
+    if not configured:
+        return own_global_hooks_dir()
+    path = Path(os.path.expanduser(configured))
+    if not path.is_absolute():
+        raise UsageError(f"the global core.hooksPath {configured!r} is relative to each repository: use git ai-usage install in each repository")
+    return path
+
+
+def install(global_: bool = False, remotes: list[str] = ()) -> None:
+    scope = ("--global",) if global_ else ()
+    if global_:
+        hooks_dir = global_hooks_dir()
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        if hooks_dir == own_global_hooks_dir():
+            for name in CLIENT_HOOKS:
+                block = hook_block(name) if name in OUR_HOOKS else ""
+                write_hook(hooks_dir / name, f"#!/bin/sh\n{block}{chain(name)}")
+        else:
+            for name in OUR_HOOKS:
+                install_hook(hooks_dir, name)
+        git("config", "--global", "core.hooksPath", hooks_dir.as_posix())
+        # --replace-all first, so the filter is never empty while hooks of other repositories run.
+        if remotes:
+            git("config", "--global", "--replace-all", REMOTE_KEY, remotes[0])
+        else:
+            git("config", "--global", "--unset-all", REMOTE_KEY, check=False)
+        for remote in remotes[1:]:
+            add_config(REMOTE_KEY, remote, scope)
+    else:
+        hooks_dir = Path(git("rev-parse", "--git-path", "hooks").rstrip("\n"))
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        for name in OUR_HOOKS:
+            install_hook(hooks_dir, name)
     # Notes follow commits through amend and rebase, and git log shows them.
-    add_config("notes.rewriteRef", NOTES_REF)
-    add_config("notes.displayRef", NOTES_REF)
+    add_config("notes.rewriteRef", NOTES_REF, scope)
+    add_config("notes.displayRef", NOTES_REF, scope)
     print(f"Installed post-commit and pre-push hooks in {hooks_dir}")
 
 
-def uninstall() -> None:
-    hooks_dir = Path(git("rev-parse", "--git-path", "hooks").rstrip("\n"))
-    for name in ("post-commit", "pre-push"):
-        path = hooks_dir / name
-        if path.exists() and HOOK_START in path.read_text():
-            content = re.sub(re.escape(HOOK_START) + r".*?" + re.escape(HOOK_END) + r"\n?", "", path.read_text(), flags=re.S)
-            if content.strip() in ("", "#!/bin/sh"):
-                path.unlink()
-            else:
-                path.write_text(content)
+def uninstall(global_: bool = False) -> None:
+    scope = ("--global",) if global_ else ()
+    hooks_dir = global_hooks_dir() if global_ else Path(git("rev-parse", "--git-path", "hooks").rstrip("\n"))
+    if global_ and hooks_dir == own_global_hooks_dir():
+        for name in CLIENT_HOOKS:
+            (hooks_dir / name).unlink(missing_ok=True)
+        git("config", "--global", "--unset", "core.hooksPath", check=False)
+        git("config", "--global", "--unset-all", REMOTE_KEY, check=False)
+    else:
+        for name in OUR_HOOKS:
+            path = hooks_dir / name
+            if path.exists() and HOOK_START in path.read_text():
+                content = re.sub(re.escape(HOOK_START) + r".*?" + re.escape(HOOK_END) + r"\n?", "", path.read_text(), flags=re.S)
+                if content.strip() in ("", "#!/bin/sh"):
+                    path.unlink()
+                else:
+                    write_hook(path, content)
     for key in ("notes.rewriteRef", "notes.displayRef"):
-        git("config", "--unset", key, re.escape(NOTES_REF), check=False)
+        git("config", *scope, "--unset", key, re.escape(NOTES_REF), check=False)
     print("Removed the hooks. Existing notes stay in refs/notes/ai-usage.")
+
+
+def host_path(url: str) -> str:
+    """ "https://user@github.com/acme/x.git" and "git@github.com:acme/x.git" give "github.com/acme/x.git"."""
+    url, scheme = re.subn(r"^[a-z][a-z0-9+.-]*://", "", url.strip().lower())
+    url = url.split("@", 1)[1] if "@" in url.split("/", 1)[0] else url
+    # Only a URL with a scheme has a port; in "host:123/x" (scp syntax) "123" is a namespace.
+    return re.sub(r"^([^/:]+):\d+/" if scheme else r"^([^/:]+):", r"\1/", url)
+
+
+def remote_allowed(remote: str) -> bool:
+    """With ai-usage.remote set, the hooks run only where the push URL starts with one of its values (host/path)."""
+    allowed = git("config", "--get-all", REMOTE_KEY, check=False).split()
+    if not allowed:
+        return True
+    url = host_path(git("remote", "get-url", "--push", remote, check=False).strip() or remote)
+    return any(url.startswith(host_path(value)) for value in allowed)
 
 
 def fetch(remote: str) -> None:
@@ -1315,8 +1399,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--offline", action="store_true", help="never download prices; use the built-in ones (or GIT_AI_USAGE_OFFLINE=1)")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("setup", help="install the hooks, then offer to backfill and push")
-    commands.add_parser("install", help="install the post-commit and pre-push hooks in this repository")
-    commands.add_parser("uninstall", help="remove the hooks (the notes stay)")
+    install_parser = commands.add_parser("install", help="install the post-commit and pre-push hooks in this repository")
+    install_parser.add_argument("--global", dest="global_", action="store_true", help="install for all repositories of this user (core.hooksPath)")
+    install_parser.add_argument("--remote", action="append", default=[],
+                                help="with --global: run only where the push URL starts with this host and path, e.g. github.com/acme/ (repeatable)")
+    uninstall_parser = commands.add_parser("uninstall", help="remove the hooks (the notes stay)")
+    uninstall_parser.add_argument("--global", dest="global_", action="store_true", help="remove the global install")
     backfill_parser = commands.add_parser("backfill", help="write notes for your past commits")
     backfill_parser.add_argument("--author", help="author email (default: git config user.email)")
     backfill_parser.add_argument("--force", action="store_true", help="also rewrite commits that already have a note")
@@ -1339,6 +1427,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "hook":
             try:
+                if not remote_allowed(args.remote):
+                    return 0
                 if args.name == "post-commit":
                     note_head()
                 else:
@@ -1349,9 +1439,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "setup":
             setup()
         elif args.command == "install":
-            install()
+            install(args.global_, args.remote)
         elif args.command == "uninstall":
-            uninstall()
+            uninstall(args.global_)
         elif args.command == "backfill":
             written = backfill(args.author or user_email(), force=args.force, extra_paths=args.path)
             print(f"Wrote {written} note{'' if written == 1 else 's'}.")
