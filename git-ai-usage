@@ -1109,7 +1109,7 @@ def in_rebase() -> bool:
 
 def backfill(email: str, force: bool = False, extra_paths: list[str] | None = None, quiet: bool = False) -> int:
     """Write notes for your commits that have none. Returns the number of notes written."""
-    roots = repo_roots() + [os.path.realpath(path) for path in extra_paths or []]
+    roots = repo_roots() + [real(path) for path in extra_paths or []]
     commits = list_commits(*CODE_REFS)
     mine = own_commits(email, commits)
     bounds = own_commit_times(email, commits)
@@ -1273,7 +1273,12 @@ def own_global_hooks_dir() -> Path:
 def global_hooks_dir() -> Path:
     """The global core.hooksPath if one is set, else our own folder."""
     configured = git("config", "--global", "core.hooksPath", check=False).strip()
-    return Path(os.path.expanduser(configured)) if configured else own_global_hooks_dir()
+    if not configured:
+        return own_global_hooks_dir()
+    path = Path(os.path.expanduser(configured))
+    if not path.is_absolute():
+        raise UsageError(f"the global core.hooksPath {configured!r} is relative to each repository: use git ai-usage install in each repository")
+    return path
 
 
 def install(global_: bool = False, remotes: list[str] = ()) -> None:
@@ -1289,6 +1294,7 @@ def install(global_: bool = False, remotes: list[str] = ()) -> None:
             for name in OUR_HOOKS:
                 install_hook(hooks_dir, name)
         git("config", "--global", "core.hooksPath", hooks_dir.as_posix())
+        git("config", "--global", "--unset-all", REMOTE_KEY, check=False)
         for remote in remotes:
             add_config(REMOTE_KEY, remote, scope)
     else:
@@ -1324,13 +1330,20 @@ def uninstall(global_: bool = False) -> None:
     print("Removed the hooks. Existing notes stay in refs/notes/ai-usage.")
 
 
+def host_path(url: str) -> str:
+    """ "https://user@github.com/acme/x.git" and "git@github.com:acme/x.git" give "github.com/acme/x.git"."""
+    url = re.sub(r"^[a-z][a-z0-9+.-]*://", "", url.strip().lower())
+    url = url.split("@", 1)[1] if "@" in url.split("/", 1)[0] else url
+    return re.sub(r"^([^/:]+):(\d+/)?", r"\1/", url)
+
+
 def remote_allowed(remote: str) -> bool:
-    """With ai-usage.remote set, the hooks run only for a remote URL that contains one of its values."""
+    """With ai-usage.remote set, the hooks run only where the push URL starts with one of its values (host/path)."""
     allowed = git("config", "--get-all", REMOTE_KEY, check=False).split()
     if not allowed:
         return True
-    url = git("remote", "get-url", remote, check=False).strip() or remote
-    return any(value.lower() in url.lower() for value in allowed)
+    url = host_path(git("remote", "get-url", "--push", remote, check=False).strip() or remote)
+    return any(url.startswith(host_path(value)) for value in allowed)
 
 
 def fetch(remote: str) -> None:
@@ -1384,7 +1397,7 @@ def main(argv: list[str] | None = None) -> int:
     install_parser = commands.add_parser("install", help="install the post-commit and pre-push hooks in this repository")
     install_parser.add_argument("--global", dest="global_", action="store_true", help="install for all repositories of this user (core.hooksPath)")
     install_parser.add_argument("--remote", action="append", default=[],
-                                help="with --global: run only where the remote URL contains this text, e.g. github.com/acme/ (repeatable)")
+                                help="with --global: run only where the push URL starts with this host and path, e.g. github.com/acme/ (repeatable)")
     uninstall_parser = commands.add_parser("uninstall", help="remove the hooks (the notes stay)")
     uninstall_parser.add_argument("--global", dest="global_", action="store_true", help="remove the global install")
     backfill_parser = commands.add_parser("backfill", help="write notes for your past commits")

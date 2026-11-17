@@ -593,11 +593,26 @@ class GlobalInstallTest(Sandbox):
         skipped = self.commit(1)
         self.assertEqual(self.note(skipped), [])
         self.git("remote", "set-url", "origin", "git@github.com:acme/app.git")
+        self.assertTrue(tool.remote_allowed("origin"))
+        self.git("remote", "set-url", "origin", "https://example.net/github.com/acme/app.git")
         self.assertFalse(tool.remote_allowed("origin"))
+        self.git("remote", "set-url", "origin", "https://github.com/acme/app.git")
+        self.git("remote", "set-url", "--push", "origin", "https://github.com/someone/app.git")
+        self.assertFalse(tool.remote_allowed("origin"))
+        tool.install(global_=True, remotes=["github.com/someone/"])
+        self.assertTrue(tool.remote_allowed("origin"))
+        tool.install(global_=True, remotes=["github.com/acme/"])
+        self.assertFalse(tool.remote_allowed("origin"))
+        self.git("config", "--unset", "remote.origin.pushurl")
         self.git("remote", "set-url", "origin", "https://github.com/ACME/app.git")
         self.call(path, T0 + 1500, out=7)
         sha = self.commit(2)
         self.assertEqual(self.note(sha)[0]["out"], "7")
+
+    def test_a_relative_global_hooks_path_stops_the_install(self):
+        self.git("config", "--global", "core.hooksPath", ".githooks")
+        with self.assertRaises(tool.UsageError):
+            tool.install(global_=True)
 
     def test_uninstall_removes_the_global_hooks(self):
         tool.install(global_=True, remotes=["github.com/acme/"])

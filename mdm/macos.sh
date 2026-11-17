@@ -3,7 +3,7 @@
 # Fleet, Intune for macOS). Run it again at each check-in: it is safe to run many times, and
 # it also sets up the users that were added after the last run.
 #
-# REMOTE: the hooks run only in repositories whose remote URL contains this text. Put the
+# REMOTE: the hooks run only in repositories whose push URL starts with this host and path. Put the
 # organization of your git provider here, for example "github.com/acme/". Separate two or
 # more values with a space. Set REMOTE="" to run in all repositories.
 REMOTE="${GIT_AI_USAGE_REMOTE-github.com/REPLACE_ORG/}"

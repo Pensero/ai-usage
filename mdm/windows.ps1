@@ -2,7 +2,7 @@
 # as SYSTEM: in Intune, set "Run this script using the logged on credentials" to Yes; with
 # Group Policy, use a user logon script. It is safe to run many times.
 #
-# $Remote: the hooks run only in repositories whose remote URL contains this text. Put the
+# $Remote: the hooks run only in repositories whose push URL starts with this host and path. Put the
 # organization of your git provider here, for example "github.com/acme/". Separate two or
 # more values with a space. Set $Remote = "" to run in all repositories.
 $Remote = if ($null -ne $env:GIT_AI_USAGE_REMOTE) { $env:GIT_AI_USAGE_REMOTE } else { "github.com/REPLACE_ORG/" }

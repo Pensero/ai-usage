@@ -41,7 +41,7 @@ by model:
 | `git ai-usage install` | Adds the `post-commit` and `pre-push` hooks to this repository. Existing hooks stay. |
 | `git ai-usage backfill` | Writes notes for your past commits that have none (`--force` rewrites them, `--path` adds an earlier path of the clone, `--author` uses another email) |
 | `git ai-usage push` / `fetch` | Sends or gets `refs/notes/ai-usage`, merging the notes of other people |
-| `git ai-usage install --global [--remote TEXT]` | Adds the hooks to all repositories of this user (`core.hooksPath`). The hooks of each repository still run. With `--remote`, only repositories whose remote URL contains `TEXT` get notes. |
+| `git ai-usage install --global [--remote TEXT]` | Adds the hooks to all repositories of this user (`core.hooksPath`). The hooks of each repository still run. With `--remote`, only repositories whose push URL starts with `TEXT` (host and path, HTTPS or SSH) get notes. |
 | `git ai-usage uninstall` | Removes the hooks. The notes stay. |
 | `git ai-usage uninstall --global` | Removes the global install. |
 
