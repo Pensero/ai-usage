@@ -47,6 +47,7 @@ class Sandbox(unittest.TestCase):
             "CODEX_HOME": str(self.home / ".codex"),
             "GIT_AI_USAGE_OFFLINE": "1",
             "XDG_CACHE_HOME": str(self.tmp / "cache"),
+            "XDG_CONFIG_HOME": str(self.tmp / "config"),
         })
         self.repo = self.tmp / "repo"
         self.repo.mkdir()
@@ -557,6 +558,52 @@ class HookTest(Sandbox):
         self.assertEqual(len(per_commit), 2)
         self.assertEqual(total.tokens["out"], 30)
         self.assertEqual(set(per_model), {("claude-code", "claude-opus-4-1"), ("claude-code", "claude-sonnet-4-5")})
+
+
+class GlobalInstallTest(Sandbox):
+    def setUp(self):
+        super().setUp()
+        self.commit(0)
+        self.local_hooks = Path(self.git("rev-parse", "--git-common-dir").strip()) / "hooks"
+
+    def test_writes_the_note_and_runs_the_hook_of_the_repository(self):
+        tool.install(global_=True)
+        self.local_hooks.mkdir(exist_ok=True)
+        tool.write_hook(self.local_hooks / "post-commit", "#!/bin/sh\necho existing > marker.txt\n")
+        path = self.transcript()
+        self.call(path, T0 + 500, out=33)
+        sha = self.commit(1)
+        self.assertEqual(self.note(sha)[0]["out"], "33")
+        self.assertTrue((self.repo / "marker.txt").exists())
+
+    def test_a_failed_hook_of_the_repository_still_stops_the_commit(self):
+        tool.install(global_=True)
+        self.local_hooks.mkdir(exist_ok=True)
+        tool.write_hook(self.local_hooks / "pre-commit", "#!/bin/sh\nexit 1\n")
+        (self.repo / "a.txt").write_text("a\n")
+        self.git("add", "a.txt")
+        result = subprocess.run(["git", "commit", "-q", "-m", "blocked"], capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_runs_only_for_the_remotes_of_the_organization(self):
+        tool.install(global_=True, remotes=["github.com/acme/"])
+        self.git("remote", "add", "origin", "https://github.com/someone/side-project.git")
+        path = self.transcript()
+        self.call(path, T0 + 500, out=33)
+        skipped = self.commit(1)
+        self.assertEqual(self.note(skipped), [])
+        self.git("remote", "set-url", "origin", "git@github.com:acme/app.git")
+        self.assertFalse(tool.remote_allowed("origin"))
+        self.git("remote", "set-url", "origin", "https://github.com/ACME/app.git")
+        self.call(path, T0 + 1500, out=7)
+        sha = self.commit(2)
+        self.assertEqual(self.note(sha)[0]["out"], "7")
+
+    def test_uninstall_removes_the_global_hooks(self):
+        tool.install(global_=True, remotes=["github.com/acme/"])
+        tool.uninstall(global_=True)
+        self.assertEqual(subprocess.run(["git", "config", "--global", "core.hooksPath"], capture_output=True).stdout, b"")
+        self.assertEqual(list(tool.own_global_hooks_dir().iterdir()), [])
 
 
 class RemoteTest(Sandbox):

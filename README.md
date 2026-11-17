@@ -41,7 +41,32 @@ by model:
 | `git ai-usage install` | Adds the `post-commit` and `pre-push` hooks to this repository. Existing hooks stay. |
 | `git ai-usage backfill` | Writes notes for your past commits that have none (`--force` rewrites them, `--path` adds an earlier path of the clone, `--author` uses another email) |
 | `git ai-usage push` / `fetch` | Sends or gets `refs/notes/ai-usage`, merging the notes of other people |
+| `git ai-usage install --global [--remote TEXT]` | Adds the hooks to all repositories of this user (`core.hooksPath`). The hooks of each repository still run. With `--remote`, only repositories whose remote URL contains `TEXT` get notes. |
 | `git ai-usage uninstall` | Removes the hooks. The notes stay. |
+| `git ai-usage uninstall --global` | Removes the global install. |
+
+## Install for a whole organization (MDM)
+
+Push one script with your device management tool. It installs the tool and runs
+`git ai-usage install --global` for each user, so no developer has to do a step.
+
+- macOS (Jamf, Kandji, Fleet, Intune): [`mdm/macos.sh`](mdm/macos.sh), as root.
+- Windows (Intune, Group Policy): [`mdm/windows.ps1`](mdm/windows.ps1), as the signed-in user.
+
+Set `REMOTE` (or `$Remote`) at the top of the script to the organization of your git provider, for
+example `github.com/acme/`. Then the hooks do not write or push notes in personal or open-source
+repositories. Run the script again at each check-in: it is safe to run many times.
+
+Limits of the global install:
+
+- A repository that sets its own `core.hooksPath` (for example husky) does not use the global
+  hooks. Run `git ai-usage install` in that repository.
+- `pre-commit install` refuses to run when `core.hooksPath` is set. Run
+  `GIT_CONFIG_GLOBAL=/dev/null pre-commit install` (Windows: `$env:GIT_CONFIG_GLOBAL="NUL"` first).
+  The global hooks then run the pre-commit hook of the repository.
+
+Step-by-step instructions for each MDM tool are in the
+[Help Center](https://help.pensero.ai/en/articles/17655768-git-ai-usage-record-the-ai-cost-of-each-commit).
 
 ## How it works
 
