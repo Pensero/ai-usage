@@ -1294,8 +1294,12 @@ def install(global_: bool = False, remotes: list[str] = ()) -> None:
             for name in OUR_HOOKS:
                 install_hook(hooks_dir, name)
         git("config", "--global", "core.hooksPath", hooks_dir.as_posix())
-        git("config", "--global", "--unset-all", REMOTE_KEY, check=False)
-        for remote in remotes:
+        # --replace-all first, so the filter is never empty while hooks of other repositories run.
+        if remotes:
+            git("config", "--global", "--replace-all", REMOTE_KEY, remotes[0])
+        else:
+            git("config", "--global", "--unset-all", REMOTE_KEY, check=False)
+        for remote in remotes[1:]:
             add_config(REMOTE_KEY, remote, scope)
     else:
         hooks_dir = Path(git("rev-parse", "--git-path", "hooks").rstrip("\n"))
@@ -1332,9 +1336,10 @@ def uninstall(global_: bool = False) -> None:
 
 def host_path(url: str) -> str:
     """ "https://user@github.com/acme/x.git" and "git@github.com:acme/x.git" give "github.com/acme/x.git"."""
-    url = re.sub(r"^[a-z][a-z0-9+.-]*://", "", url.strip().lower())
+    url, scheme = re.subn(r"^[a-z][a-z0-9+.-]*://", "", url.strip().lower())
     url = url.split("@", 1)[1] if "@" in url.split("/", 1)[0] else url
-    return re.sub(r"^([^/:]+):(\d+/)?", r"\1/", url)
+    # Only a URL with a scheme has a port; in "host:123/x" (scp syntax) "123" is a namespace.
+    return re.sub(r"^([^/:]+):\d+/" if scheme else r"^([^/:]+):", r"\1/", url)
 
 
 def remote_allowed(remote: str) -> bool:

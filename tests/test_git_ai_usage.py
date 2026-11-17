@@ -596,6 +596,8 @@ class GlobalInstallTest(Sandbox):
         self.assertTrue(tool.remote_allowed("origin"))
         self.git("remote", "set-url", "origin", "https://example.net/github.com/acme/app.git")
         self.assertFalse(tool.remote_allowed("origin"))
+        self.assertEqual(tool.host_path("ssh://git@github.com:22/acme/app"), "github.com/acme/app")
+        self.assertEqual(tool.host_path("git@github.com:123/acme/app.git"), "github.com/123/acme/app.git")
         self.git("remote", "set-url", "origin", "https://github.com/acme/app.git")
         self.git("remote", "set-url", "--push", "origin", "https://github.com/someone/app.git")
         self.assertFalse(tool.remote_allowed("origin"))
