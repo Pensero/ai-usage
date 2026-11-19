@@ -310,6 +310,104 @@ class BackfillTest(Sandbox):
         self.assertEqual(tool.read_note(self.git("rev-parse", "HEAD").strip()), "")
 
 
+class ToolCallTest(Sandbox):
+    def tool_call(self, path: Path, when: float, uses: dict, message_id: str, model="claude-opus-4-1"):
+        """One assistant message with tool_use blocks: {tool_use id: (tool name, input)}."""
+        self.messages += 1
+        content = [{"type": "tool_use", "id": use_id, "name": name, "input": data} for use_id, (name, data) in uses.items()]
+        record = {
+            "type": "assistant", "timestamp": iso(when), "cwd": str(self.repo), "uuid": f"u{self.messages}",
+            "message": {"id": message_id, "model": model, "content": content,
+                        "usage": {"input_tokens": 10, "output_tokens": 100}},
+        }
+        with path.open("a") as handle:
+            handle.write(json.dumps(record) + "\n")
+
+    def tool_result(self, path: Path, when: float, use_id: str, error: bool):
+        record = {"type": "user", "timestamp": iso(when), "cwd": str(self.repo), "uuid": f"r{use_id}",
+                  "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use_id, "is_error": error}]}}
+        with path.open("a") as handle:
+            handle.write(json.dumps(record) + "\n")
+
+    def test_the_model_line_counts_tool_calls_by_category_and_mcp_tool(self):
+        path = self.transcript()
+        self.commit(1)
+        self.tool_call(path, T0 + 1100, {
+            "t1": ("Edit", {"file_path": "/secret/a.py"}),
+            "t2": ("Bash", {"command": "cd app && git status"}),
+            "t3": ("Bash", {"command": "curl https://token@x.example"}),
+            "t4": ("mcp__Linear__get_issue", {"id": "PEN-1"}),
+        }, message_id="m-a")
+        self.tool_call(path, T0 + 1200, {"t5": ("mcp__linear__get_issue", {}), "t6": ("TodoWrite", {})}, message_id="m-b")
+        # A resumed session copies the message again.
+        self.tool_call(path, T0 + 1300, {"t5": ("mcp__linear__get_issue", {})}, message_id="m-b")
+        self.tool_result(path, T0 + 1400, "t4", error=True)
+        self.tool_result(path, T0 + 1400, "t5", error=False)
+        sha = self.commit(2)
+        tool.backfill(EMAIL, quiet=True)
+        [entry] = self.note(sha)
+        self.assertEqual(
+            (entry["tools"], entry["mcp"]),
+            ("file_edit:1,git:1,other:1,ticketing:2,web:1", "linear/get_issue:2:1"),
+        )
+        self.assertNotIn("secret", entry["_line"])
+        self.assertNotIn("token", entry["_line"])
+
+    def test_a_failure_after_the_commit_counts_on_the_call(self):
+        path = self.transcript()
+        self.commit(1)
+        self.tool_call(path, T0 + 1900, {"t1": ("mcp__posthog__query", {})}, message_id="m-a")
+        first = self.commit(2)
+        self.call(path, T0 + 2500)
+        self.tool_result(path, T0 + 2100, "t1", error=True)
+        self.commit(3)
+        tool.backfill(EMAIL, quiet=True)
+        self.assertEqual(self.note(first)[0]["mcp"], "posthog/query:1:1")
+
+    def test_a_line_without_tool_calls_has_no_tool_keys(self):
+        path = self.transcript()
+        self.commit(1)
+        self.call(path, T0 + 1500)
+        sha = self.commit(2)
+        tool.backfill(EMAIL, quiet=True)
+        self.assertFalse({"tools", "mcp"} & set(self.note(sha)[0]))
+
+    def test_names_that_are_not_plain_stay_out_of_the_note(self):
+        self.assertEqual(
+            [tool.tool_use({"name": name}) for name in ("mcp__https://x.example/s__run", "mcp__acme__a/b", "mcp__ccd_session__mark")],
+            [("mcp_other", None, None), ("mcp_other", "acme", ""), ("other", "ccd_session", "mark")],
+        )
+
+    def test_the_categories_are_the_same_as_in_pensero_otel(self):
+        # The cases of test_tool_category in Pensero/pensero otel_collector/session_storage_test.py.
+        cases = [
+            ("Edit", {}, "file_edit"),
+            ("Grep", {}, "read_search"),
+            ("WebSearch", {}, "web"),
+            ("Task", {}, "subagent"),
+            ("Bash", {"command": "git"}, "git"),
+            ("Bash", {"command": "/usr/bin/curl https://x.example"}, "web"),
+            ("Bash", {"command": "pytest -q"}, "shell"),
+            ("Bash", {"command": "cd app && FOO=1 timeout 60 grep -r x ."}, "read_search"),
+            ("Bash", {"command": "gh pr view 12"}, "git"),
+            ("Bash", {"command": "cd app\ngit status"}, "git"),
+            ("Bash", {}, "shell"),
+            ("mcp__chrome-devtools__click", {}, "browser"),
+            ("mcp__posthog__query", {}, "analytics"),
+            ("mcp__clickhouse__run_select_query", {}, "analytics"),
+            ("mcp__linear__save_issue", {}, "ticketing"),
+            ("mcp__notion__search", {}, "business_app"),
+            ("mcp__0b6c1e2a-uuid__slack_send_message", {}, "business_app"),
+            ("mcp__ccd_session__mark_chapter", {}, "other"),
+            ("mcp__acme-platform__get_node", {}, "mcp_other"),
+            ("TodoWrite", {}, "other"),
+        ]
+        self.assertEqual(
+            [tool.tool_use({"name": name, "input": data})[0] for name, data, _ in cases],
+            [category for _, _, category in cases],
+        )
+
+
 class CodexTest(Sandbox):
     def test_usage_and_patches_go_to_the_commit_window(self):
         path = self.rollout("t1")

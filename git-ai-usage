@@ -13,9 +13,13 @@ belongs to exactly one window, so no record is counted twice.
 
 Note format, one line per tool and model (plus one line per tool for edited lines):
 
-    claude-code model=claude-opus-4-1 in=1200 out=5400 cache_read=230000 cache_write=12000 cost_usd=1.8400 author=dev@example.com from=1791000000 to=1791003600
+    claude-code model=claude-opus-4-1 in=1200 out=5400 cache_read=230000 cache_write=12000 cost_usd=1.8400 price_src=litellm tools=file_edit:12,shell:30 mcp=linear/get_issue:3:0 author=dev@example.com from=1791000000 to=1791003600
     claude-code added=120 deleted=14 author=dev@example.com from=1791000000 to=1791003600
     codex model=gpt-5.6-sol in=3100 out=900 cache_read=410000 cache_write=0 cost_usd=0.1940 author=dev@example.com from=1791000000 to=1791003600
+
+`tools` is the count of the tool calls of each category, and `mcp` is `server/tool:calls:failed`
+for each MCP tool (Claude Code only). The categories are the same as in Pensero's OTel tool calls.
+No input, command, path or URL goes in the note: a shell command only selects the category here.
 
 Readers sum the numeric keys of the unique lines. A line is identified by its tool, its model (or
 none, for edited lines) and its window (from, to), so a note copied twice by an amend is counted
@@ -41,7 +45,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 NOTES_REF = "refs/notes/ai-usage"
 REMOTE_COPY_REF = "refs/notes/ai-usage-remote"
@@ -335,6 +339,8 @@ class Call:
     tokens: dict
     tool: str = CLAUDE_TOOL
     tier: str = ""
+    # The tool calls of the message, by tool_use id: (category, MCP server, MCP tool, failed).
+    uses: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -345,6 +351,108 @@ class Edit:
     tool: str = CLAUDE_TOOL
     # The non-blank text of the lines, by file path: {path: (added lines, deleted lines)}.
     texts: dict = field(default_factory=dict)
+
+
+# --- tool calls -------------------------------------------------------------------
+# The same rules as `otel_collector/session_storage.py` in Pensero/pensero, so the notes and the
+# OTel export give the same categories. Change both together.
+
+TOOL_CATEGORIES = {
+    "Edit": "file_edit",
+    "MultiEdit": "file_edit",
+    "Write": "file_edit",
+    "NotebookEdit": "file_edit",
+    "Read": "read_search",
+    "Grep": "read_search",
+    "Glob": "read_search",
+    "LS": "read_search",
+    "NotebookRead": "read_search",
+    "WebFetch": "web",
+    "WebSearch": "web",
+    "Task": "subagent",
+    "Agent": "subagent",
+}
+# Words of public products in an MCP server or tool name. The server name is checked first, then
+# the tool name. The first match sets the category.
+MCP_CATEGORIES = (
+    (("chrome", "playwright", "puppeteer", "browser"), "browser"),
+    (("posthog", "amplitude", "mixpanel", "metabase", "looker", "datadog", "sentry", "clickhouse", "bigquery"), "analytics"),
+    (("linear", "jira", "atlassian", "asana", "clickup", "shortcut", "youtrack"), "ticketing"),
+    (
+        ("slack", "gmail", "outlook", "calendar", "meeting", "transcript", "gong", "notion", "confluence")
+        + ("gdrive", "google_drive", "google_docs", "gdocs", "sheets", "slides", "figma")
+        + ("salesforce", "hubspot", "apollo", "intercom"),
+        "business_app",
+    ),
+    (("github", "gitlab", "bitbucket"), "git"),
+    (("supabase", "vercel", "netlify", "cloudflare", "aws", "kubernetes", "docker", "terraform"), "shell"),
+)
+# MCP servers of Claude Desktop itself (ccd_session, ccd_pr, ...). They are not work.
+ASSISTANT_MCP_PREFIX = "ccd_"
+WEB_COMMANDS = {"curl", "wget"}
+GIT_COMMANDS = {"git", "gh"}
+READ_COMMANDS = {"grep", "rg", "sed", "cat", "ls", "head", "tail", "find", "wc", "awk", "jq", "tree", "less", "diff"}
+COMMAND_PREFIXES = {"sudo", "env", "time", "nohup", "timeout"}
+COMMAND_SEPARATOR = re.compile(r"&&|\|\||;|\||\n")
+# Only plain names go in a note: a value with other characters (a URL, a path) can carry secrets.
+MCP_NAME = re.compile(r"[\w.\-]{1,100}")
+
+
+def mcp_names(tool_name: str) -> tuple[str, str] | None:
+    """Lowercase server and tool of an `mcp__server__tool` name, or None for other tools."""
+    if not tool_name.startswith("mcp__"):
+        return None
+    parts = tool_name.split("__", 2) + ["", ""]
+    return parts[1].lower(), parts[2].lower()
+
+
+def mcp_category(server: str, tool: str) -> str:
+    if server.startswith(ASSISTANT_MCP_PREFIX):
+        return "other"
+    for name in (server, tool):
+        for keys, category in MCP_CATEGORIES:
+            if any(key in name for key in keys):
+                return category
+    return "mcp_other"
+
+
+def command_program(command: str) -> str:
+    """First program of a shell command, without `cd` steps, `VAR=value` and prefixes such as `sudo`."""
+    for part in COMMAND_SEPARATOR.split(command):
+        words = part.split()
+        while words and (words[0] in COMMAND_PREFIXES or "=" in words[0] or words[0].isdigit()):
+            words.pop(0)
+        if not words:
+            continue
+        program = words[0].rsplit("/", 1)[-1]
+        if program != "cd":
+            return program
+    return ""
+
+
+def bash_category(command: str) -> str:
+    program = command_program(command)
+    if program in GIT_COMMANDS:
+        return "git"
+    if program in READ_COMMANDS:
+        return "read_search"
+    return "web" if program in WEB_COMMANDS else "shell"
+
+
+def tool_use(block: dict) -> tuple[str, str | None, str | None]:
+    """(category, MCP server, MCP tool) of one Claude Code tool_use block. Names that are not plain are left out."""
+    name = str(block.get("name") or "")
+    if category := TOOL_CATEGORIES.get(name):
+        return category, None, None
+    if name == "Bash":
+        return bash_category(str((block.get("input") or {}).get("command") or "")), None, None
+    names = mcp_names(name)
+    if names is None:
+        return "other", None, None
+    server, tool = names
+    if not MCP_NAME.fullmatch(server):
+        return mcp_category(server, tool), None, None
+    return mcp_category(server, tool), server, tool if MCP_NAME.fullmatch(tool) else ""
 
 
 def edited_lines(result: dict) -> tuple[int, int]:
@@ -388,6 +496,7 @@ def read_transcripts(roots: list[str], since: float | None = None) -> tuple[list
     """
     calls: dict[str, Call] = {}
     edits: dict[str, Edit] = {}
+    failed: set[str] = set()
     for folder in project_dirs(roots):
         for path in folder.rglob("*.jsonl"):
             try:
@@ -398,17 +507,24 @@ def read_transcripts(roots: list[str], since: float | None = None) -> tuple[list
                 continue
             with handle:
                 for line in handle:
-                    if '"assistant"' not in line and '"toolUseResult"' not in line:
+                    if '"assistant"' not in line and '"toolUseResult"' not in line and '"tool_result"' not in line:
                         continue
                     try:
-                        _read_record(json.loads(line), roots, calls, edits)
+                        _read_record(json.loads(line), roots, calls, edits, failed)
                     except (ValueError, KeyError, TypeError, AttributeError):
                         # An open session has a half-written last line.
                         continue
+    for call in calls.values():
+        call.uses = {use_id: (*use[:3], use_id in failed) for use_id, use in call.uses.items()}
     return list(calls.values()), list(edits.values())
 
 
-def _read_record(record: dict, roots: list[str], calls: dict, edits: dict) -> None:
+def _blocks(message: object, kind: str) -> list[dict]:
+    content = message.get("content") if isinstance(message, dict) else None
+    return [block for block in content if isinstance(block, dict) and block.get("type") == kind] if isinstance(content, list) else []
+
+
+def _read_record(record: dict, roots: list[str], calls: dict, edits: dict, failed: set) -> None:
     if not record.get("timestamp") or not inside(record.get("cwd", ""), roots):
         return
     when = parse_time(record["timestamp"])
@@ -426,12 +542,15 @@ def _read_record(record: dict, roots: list[str], calls: dict, edits: dict) -> No
             "web_search": (usage.get("server_tool_use") or {}).get("web_search_requests", 0) or 0,
         }
         key = message.get("id") or record.get("uuid")
+        uses = {str(block["id"]): tool_use(block) for block in _blocks(message, "tool_use") if block.get("id")}
         previous = calls.get(key)
         if previous:
             previous.tokens = {name: max(value, previous.tokens[name]) for name, value in tokens.items()}
+            previous.uses.update(uses)
             return
-        calls[key] = Call(when, message.get("model", ""), usage.get("speed") == "fast", tokens)
+        calls[key] = Call(when, message.get("model", ""), usage.get("speed") == "fast", tokens, uses=uses)
         return
+    failed.update(str(block.get("tool_use_id")) for block in _blocks(record.get("message"), "tool_result") if block.get("is_error"))
     result = record.get("toolUseResult")
     if isinstance(result, dict) and record.get("uuid"):
         added, deleted = edited_lines(result)
@@ -1010,7 +1129,7 @@ def note_for_window(
     start: int, end: int, calls: list[Call], edits: list[Edit], author: str = "", committed: dict | None = None
 ) -> str:
     per_model: dict[tuple[str, str], dict] = defaultdict(
-        lambda: {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0, "src": set()}
+        lambda: {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0, "src": set(), "tools": Counter(), "mcp": {}}
     )
     for call in calls:
         if start < call.when <= end:
@@ -1020,6 +1139,12 @@ def note_for_window(
             cost, source = priced(call)
             total["cost"] += cost
             total["src"].update(source.split("+"))
+            for category, server, mcp_tool, failed in call.uses.values():
+                total["tools"][category] += 1
+                if server is not None:
+                    counts = total["mcp"].setdefault(f"{server}/{mcp_tool}", [0, 0])
+                    counts[0] += 1
+                    counts[1] += failed
     lines = []
     span = f"author={author} from={start} to={end}" if author else f"from={start} to={end}"
     for tool in TOOLS:
@@ -1028,7 +1153,7 @@ def note_for_window(
             if not any(total[key] for key in TOKEN_KEYS):
                 continue
             counts = " ".join(f"{key}={total[key]}" for key in TOKEN_KEYS)
-            lines.append(f"{tool} model={model} {counts} cost_usd={total['cost']:.4f} price_src={'+'.join(sorted(total['src']))} {span}")
+            lines.append(f"{tool} model={model} {counts} cost_usd={total['cost']:.4f} price_src={'+'.join(sorted(total['src']))}{tool_keys(total)} {span}")
         added = sum(edit.added for edit in edits if edit.tool == tool and start < edit.when <= end)
         deleted = sum(edit.deleted for edit in edits if edit.tool == tool and start < edit.when <= end)
         committed_added, committed_deleted = (committed or {}).get(tool, (0, 0))
@@ -1038,6 +1163,16 @@ def note_for_window(
                 f"committed_added={committed_added} committed_deleted={committed_deleted} {span}"
             )
     return "".join(line + "\n" for line in lines)
+
+
+def tool_keys(total: dict) -> str:
+    """The ` tools=` and ` mcp=` keys of a model line, or "" when the window has no tool calls."""
+    keys = ""
+    if total["tools"]:
+        keys += " tools=" + ",".join(f"{category}:{count}" for category, count in sorted(total["tools"].items()))
+    if total["mcp"]:
+        keys += " mcp=" + ",".join(f"{name}:{calls}:{failed}" for name, (calls, failed) in sorted(total["mcp"].items()))
+    return keys
 
 
 def parse_note(text: str) -> list[dict]:

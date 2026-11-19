@@ -86,7 +86,7 @@ Step-by-step instructions for each MDM tool are in the
   get notes. One line per tool and model, and one line per tool for edited lines:
 
   ```
-  claude-code model=claude-opus-4-1 in=1200 out=54000 cache_read=23000000 cache_write=410000 cost_usd=14.1200 price_src=litellm author=dev@example.com from=1791000000 to=1791003600
+  claude-code model=claude-opus-4-1 in=1200 out=54000 cache_read=23000000 cache_write=410000 cost_usd=14.1200 price_src=litellm tools=file_edit:12,git:4,read_search:50,shell:30,ticketing:3 mcp=linear/get_issue:3:0 author=dev@example.com from=1791000000 to=1791003600
   claude-code added=212 deleted=31 committed_added=180 committed_deleted=31 author=dev@example.com from=1791000000 to=1791003600
   codex model=gpt-5.6-sol in=3100 out=900 cache_read=410000 cache_write=0 cost_usd=0.1940 price_src=litellm+models.dev author=dev@example.com from=1791000000 to=1791003600
   ```
@@ -98,6 +98,12 @@ Step-by-step instructions for each MDM tool are in the
   (a SHA that was rewritten before the push). To add it to older notes: `git ai-usage backfill --force`,
   then `git ai-usage push`.
   `in` is the input that was not read from or written to the cache, for both tools.
+  `tools` is the number of tool calls of each category, and `mcp` is `server/tool:calls:failed`
+  for each MCP tool (Claude Code only). The categories are the same as in Pensero's OTel tool calls:
+  `file_edit`, `read_search`, `shell`, `git`, `web`, `browser`, `analytics`, `ticketing`,
+  `business_app`, `subagent`, `mcp_other`, `other`. A call counts on the line of the model that
+  made it. The note has no inputs, commands, paths or URLs: a shell command only selects its
+  category, and an MCP name with other characters than letters, digits, `_`, `.` and `-` is left out.
 - **Rewrites.** `install` sets `notes.rewriteRef`, so notes follow `commit --amend` and `rebase`.
   A squash keeps the lines of all the squashed commits. An amend copy counts once.
 - **Sharing.** Git does not push notes by default. The `pre-push` hook pushes them after it
@@ -134,6 +140,7 @@ Step-by-step instructions for each MDM tool are in the
   Codex OTel export includes them, so it shows a little more (about 0.5% of the tokens on a day we
   measured). The warmup response at the start of a session, which has no output, is not counted either.
 - Only Claude Code and Codex for now.
+- Tool calls are counted for Claude Code only, not for Codex.
 
 ## Requirements
 
