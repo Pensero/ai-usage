@@ -853,7 +853,7 @@ class SessionTest(Sandbox):
                     sys.stdin = sys.__stdin__
         self.assertEqual(len(self.sessions_note(head)), 1)
 
-    def test_install_adds_the_claude_hook_and_uninstall_removes_only_it(self):
+    def test_install_adds_the_claude_hook_and_global_uninstall_removes_only_it(self):
         settings = self.home / ".claude" / "settings.json"
         settings.parent.mkdir(parents=True)
         other = {"type": "command", "command": "echo bye"}
@@ -861,7 +861,7 @@ class SessionTest(Sandbox):
                                         "hooks": {"SessionEnd": [{"hooks": [other]}]}}))
         with contextlib.redirect_stdout(io.StringIO()):
             tool.install()
-            tool.install()
+            tool.install(global_=True)
         data = json.loads(settings.read_text())
         self.assertEqual(data["cleanupPeriodDays"], 365)
         self.assertEqual(data["model"], "opus")
@@ -870,6 +870,9 @@ class SessionTest(Sandbox):
         self.assertTrue(commands[1].endswith(" session-end"))
         with contextlib.redirect_stdout(io.StringIO()):
             tool.uninstall()
+        self.assertEqual(len(json.loads(settings.read_text())["hooks"]["SessionEnd"]), 2)
+        with contextlib.redirect_stdout(io.StringIO()):
+            tool.uninstall(global_=True)
         self.assertEqual(json.loads(settings.read_text())["hooks"], {"SessionEnd": [{"hooks": [other]}]})
 
     def test_push_sends_the_sessions_ref(self):

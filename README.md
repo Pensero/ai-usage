@@ -43,7 +43,7 @@ by model:
 | `git ai-usage push` / `fetch` | Sends or gets `refs/notes/ai-usage` and `refs/notes/ai-sessions`, merging the notes of other people |
 | `git ai-usage install --global [--remote TEXT]` | Adds the hooks to all repositories of this user (`core.hooksPath`). The hooks of each repository still run. With `--remote`, only repositories whose push URL starts with `TEXT` (host and path, HTTPS or SSH) get notes. |
 | `git ai-usage session-end` | The Claude Code `SessionEnd` hook. Reads the hook JSON on stdin and writes the tool calls of the session on `HEAD`. |
-| `git ai-usage uninstall` | Removes the hooks. The notes stay. |
+| `git ai-usage uninstall` | Removes the Git hooks of this repository. The notes stay. `--global` also removes the Claude Code hook. |
 | `git ai-usage uninstall --global` | Removes the global install. |
 
 ## Install for a whole organization (MDM)

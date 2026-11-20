@@ -556,7 +556,7 @@ def update_claude_settings(install_hook: bool) -> bool:
     """Add or remove the SessionEnd hook in the Claude Code settings. The other settings stay."""
     path = claude_settings_path()
     try:
-        settings = json.loads(path.read_text()) if path.exists() else {}
+        settings = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     except (OSError, ValueError):
         settings = None
     if not isinstance(settings, dict) or not isinstance(settings.get("hooks", {}), dict):
@@ -586,7 +586,7 @@ def update_claude_settings(install_hook: bool) -> bool:
     else:
         settings.pop("hooks", None)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(settings, indent=2) + "\n")
+    path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
     return True
 
 
@@ -1611,7 +1611,9 @@ def uninstall(global_: bool = False) -> None:
     for ref in NOTES_REFS:
         for key in ("notes.rewriteRef", "notes.displayRef"):
             git("config", *scope, "--unset-all", key, re.escape(ref), check=False)
-    update_claude_settings(install_hook=False)
+    # The Claude Code hook is one for all repositories, so only the global uninstall removes it.
+    if global_:
+        update_claude_settings(install_hook=False)
     print(f"Removed the hooks. Existing notes stay in {NOTES_REF} and {SESSIONS_REF}.")
 
 
