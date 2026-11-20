@@ -788,3 +788,96 @@ class PriceSourceTest(Sandbox):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SessionTest(Sandbox):
+    def tool_session(self, name: str = "s1", when: float = T0 + 1500, cwd=None) -> Path:
+        path = self.transcript(name)
+        uses = [
+            ("t1", "Bash", {"command": "git status && echo SECRET"}),
+            ("t2", "Read", {"file_path": "/private/path"}),
+            ("t3", "mcp__Linear__get_issue", {"id": "PEN-1"}),
+            ("t4", "mcp__https://evil.example/x__run", {}),
+        ]
+        records = [
+            {"type": "assistant", "timestamp": iso(when), "cwd": str(cwd or self.repo), "sessionId": name,
+             "message": {"id": "m1", "model": "claude-opus-5",
+                         "content": [{"type": "tool_use", "id": use_id, "name": tool_name, "input": params}
+                                     for use_id, tool_name, params in uses]}},
+            {"type": "user", "timestamp": iso(when + 60), "cwd": str(cwd or self.repo), "sessionId": name,
+             "message": {"content": [{"type": "tool_result", "tool_use_id": "t3", "is_error": True},
+                                     {"type": "tool_result", "tool_use_id": "t1", "is_error": False}]}},
+        ]
+        with path.open("a") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+        return path
+
+    def sessions_note(self, sha: str) -> list[str]:
+        return tool.read_note(sha, tool.SESSIONS_REF).splitlines()
+
+    def test_backfill_writes_each_session_on_the_commit_before_its_end_once(self):
+        first = self.commit(1)
+        second = self.commit(2)
+        self.tool_session()
+        self.assertEqual(tool.backfill_sessions(EMAIL, quiet=True), 1)
+        self.assertEqual(self.sessions_note(second), [])
+        [line] = self.sessions_note(first)
+        self.assertEqual(
+            line,
+            f"claude-code session=s1 model=claude-opus-5 author={EMAIL} from={T0 + 1500} to={T0 + 1560} "
+            "calls=t1:git:::0,t2:read_search:::0,t3:ticketing:linear:get_issue:1,t4:mcp_other:::0",
+        )
+        self.assertNotIn("SECRET", line)
+        self.assertNotIn("private", line)
+        self.assertEqual(tool.backfill_sessions(EMAIL, quiet=True), 0)
+
+    def test_sessions_of_other_folders_and_with_no_tool_calls_are_skipped(self):
+        self.commit(1)
+        other = self.tmp / "other"
+        other.mkdir()
+        self.tool_session("elsewhere", cwd=other)
+        self.call(self.transcript("chat"), T0 + 1500)
+        self.assertEqual(tool.backfill_sessions(EMAIL, quiet=True), 0)
+
+    def test_session_end_hook_writes_the_session_on_head_and_replaces_its_copy(self):
+        head = self.commit(1)
+        path = self.tool_session()
+        payload = json.dumps({"session_id": "s1", "transcript_path": str(path), "cwd": str(self.repo)})
+        for _ in range(2):
+            with contextlib.redirect_stdout(io.StringIO()):
+                sys.stdin = io.StringIO(payload)
+                try:
+                    self.assertEqual(tool.main(["session-end"]), 0)
+                finally:
+                    sys.stdin = sys.__stdin__
+        self.assertEqual(len(self.sessions_note(head)), 1)
+
+    def test_install_adds_the_claude_hook_and_uninstall_removes_only_it(self):
+        settings = self.home / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        other = {"type": "command", "command": "echo bye"}
+        settings.write_text(json.dumps({"model": "opus", "cleanupPeriodDays": 10,
+                                        "hooks": {"SessionEnd": [{"hooks": [other]}]}}))
+        with contextlib.redirect_stdout(io.StringIO()):
+            tool.install()
+            tool.install()
+        data = json.loads(settings.read_text())
+        self.assertEqual(data["cleanupPeriodDays"], 365)
+        self.assertEqual(data["model"], "opus")
+        commands = [hook["command"] for group in data["hooks"]["SessionEnd"] for hook in group["hooks"]]
+        self.assertEqual(len(commands), 2)
+        self.assertTrue(commands[1].endswith(" session-end"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            tool.uninstall()
+        self.assertEqual(json.loads(settings.read_text())["hooks"], {"SessionEnd": [{"hooks": [other]}]})
+
+    def test_push_sends_the_sessions_ref(self):
+        remote = self.tmp / "remote.git"
+        self.git("init", "-q", "--bare", str(remote))
+        self.git("remote", "add", "origin", str(remote))
+        self.commit(1)
+        self.tool_session()
+        tool.backfill_sessions(EMAIL, quiet=True)
+        tool.push("origin")
+        self.assertIn(tool.SESSIONS_REF, self.git("ls-remote", str(remote)))
