@@ -41,10 +41,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 NOTES_REF = "refs/notes/ai-usage"
 REMOTE_COPY_REF = "refs/notes/ai-usage-remote"
+SESSIONS_REF = "refs/notes/ai-sessions"
+NOTES_REFS = (NOTES_REF, SESSIONS_REF)
+# Claude Code deletes transcripts after cleanupPeriodDays (30 by default). Keep a year for backfill.
+CLAUDE_RETENTION_DAYS = 365
+SESSION_ID = re.compile(r"[\w\-]{1,100}")
 CLAUDE_TOOL = "claude-code"
 CODEX_TOOL = "codex"
 TOOLS = (CLAUDE_TOOL, CODEX_TOOL)
@@ -266,8 +271,8 @@ def own_commit_times(email: str, commits: list[Commit] | None = None) -> list[in
     return sorted({commit.author_time for commit in own_commits(email, commits)})
 
 
-def read_note(sha: str) -> str:
-    return git("notes", f"--ref={NOTES_REF}", "show", sha, check=False)
+def read_note(sha: str, ref: str = NOTES_REF) -> str:
+    return git("notes", f"--ref={ref}", "show", sha, check=False)
 
 
 def notes_by_commit(rev_args: list[str]) -> list[tuple[Commit, str]]:
@@ -285,8 +290,8 @@ def notes_by_commit(rev_args: list[str]) -> list[tuple[Commit, str]]:
     return result
 
 
-def write_note(sha: str, text: str) -> None:
-    git("notes", f"--ref={NOTES_REF}", "add", "-f", "-F", "-", sha, stdin=text)
+def write_note(sha: str, text: str, ref: str = NOTES_REF) -> None:
+    git("notes", f"--ref={ref}", "add", "-f", "-F", "-", sha, stdin=text)
 
 
 # --- transcripts --------------------------------------------------------------
@@ -318,6 +323,271 @@ def inside(cwd: str, roots: list[str]) -> bool:
         return False
     path = real(cwd)
     return any(path == root or path.startswith(root.rstrip(os.sep) + os.sep) for root in roots)
+
+
+TOOL_CATEGORIES = {
+    "Edit": "file_edit",
+    "MultiEdit": "file_edit",
+    "Write": "file_edit",
+    "NotebookEdit": "file_edit",
+    "Read": "read_search",
+    "Grep": "read_search",
+    "Glob": "read_search",
+    "LS": "read_search",
+    "NotebookRead": "read_search",
+    "WebFetch": "web",
+    "WebSearch": "web",
+    "Task": "subagent",
+    "Agent": "subagent",
+}
+# Words of public products in an MCP server or tool name. The server name is checked first, then
+# the tool name. The first match sets the category.
+MCP_CATEGORIES = (
+    (("chrome", "playwright", "puppeteer", "browser"), "browser"),
+    (("posthog", "amplitude", "mixpanel", "metabase", "looker", "datadog", "sentry", "clickhouse", "bigquery"), "analytics"),
+    (("linear", "jira", "atlassian", "asana", "clickup", "shortcut", "youtrack"), "ticketing"),
+    (
+        ("slack", "gmail", "outlook", "calendar", "meeting", "transcript", "gong", "notion", "confluence")
+        + ("gdrive", "google_drive", "google_docs", "gdocs", "sheets", "slides", "figma")
+        + ("salesforce", "hubspot", "apollo", "intercom"),
+        "business_app",
+    ),
+    (("github", "gitlab", "bitbucket"), "git"),
+    (("supabase", "vercel", "netlify", "cloudflare", "aws", "kubernetes", "docker", "terraform"), "shell"),
+)
+# MCP servers of Claude Desktop itself (ccd_session, ccd_pr, ...). They are not work.
+ASSISTANT_MCP_PREFIX = "ccd_"
+WEB_COMMANDS = {"curl", "wget"}
+GIT_COMMANDS = {"git", "gh"}
+READ_COMMANDS = {"grep", "rg", "sed", "cat", "ls", "head", "tail", "find", "wc", "awk", "jq", "tree", "less", "diff"}
+COMMAND_PREFIXES = {"sudo", "env", "time", "nohup", "timeout"}
+COMMAND_SEPARATOR = re.compile(r"&&|\|\||;|\||\n")
+# Only plain names go in a note: a value with other characters (a URL, a path) can carry secrets.
+MCP_NAME = re.compile(r"[\w.\-]{1,100}")
+
+
+def mcp_names(tool_name: str) -> tuple[str, str] | None:
+    """Lowercase server and tool of an `mcp__server__tool` name, or None for other tools."""
+    if not tool_name.startswith("mcp__"):
+        return None
+    parts = tool_name.split("__", 2) + ["", ""]
+    return parts[1].lower(), parts[2].lower()
+
+
+def mcp_category(server: str, tool: str) -> str:
+    if server.startswith(ASSISTANT_MCP_PREFIX):
+        return "other"
+    for name in (server, tool):
+        for keys, category in MCP_CATEGORIES:
+            if any(key in name for key in keys):
+                return category
+    return "mcp_other"
+
+
+def command_program(command: str) -> str:
+    """First program of a shell command, without `cd` steps, `VAR=value` and prefixes such as `sudo`."""
+    for part in COMMAND_SEPARATOR.split(command):
+        words = part.split()
+        while words and (words[0] in COMMAND_PREFIXES or "=" in words[0] or words[0].isdigit()):
+            words.pop(0)
+        if not words:
+            continue
+        program = words[0].rsplit("/", 1)[-1]
+        if program != "cd":
+            return program
+    return ""
+
+
+def bash_category(command: str) -> str:
+    program = command_program(command)
+    if program in GIT_COMMANDS:
+        return "git"
+    if program in READ_COMMANDS:
+        return "read_search"
+    return "web" if program in WEB_COMMANDS else "shell"
+
+
+def tool_use(block: dict) -> tuple[str, str | None, str | None]:
+    """(category, MCP server, MCP tool) of one Claude Code tool_use block. Names that are not plain are left out."""
+    name = str(block.get("name") or "")
+    if category := TOOL_CATEGORIES.get(name):
+        return category, None, None
+    if name == "Bash":
+        return bash_category(str((block.get("input") or {}).get("command") or "")), None, None
+    names = mcp_names(name)
+    if names is None:
+        return "other", None, None
+    server, tool = names
+    if not MCP_NAME.fullmatch(server):
+        return mcp_category(server, tool), None, None
+    return mcp_category(server, tool), server, tool if MCP_NAME.fullmatch(tool) else ""
+
+
+
+
+# --- sessions -----------------------------------------------------------------
+
+
+@dataclass
+class Session:
+    session_id: str
+    start: float
+    end: float
+    cwd: str
+    model: str
+    calls: dict  # tool_use_id: (category, MCP server, MCP tool)
+    failed: set
+
+
+def _blocks(message: object, kind: str) -> list[dict]:
+    content = message.get("content") if isinstance(message, dict) else None
+    return [block for block in content if isinstance(block, dict) and block.get("type") == kind] if isinstance(content, list) else []
+
+
+def read_session(path: Path) -> Session | None:
+    """The tool calls of one Claude Code transcript, or None when it has none."""
+    session_id, cwd, times, models, calls, failed = "", "", [], Counter(), {}, set()
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict) or not record.get("timestamp"):
+            continue
+        session_id = session_id or str(record.get("sessionId") or "")
+        cwd = cwd or str(record.get("cwd") or "")
+        try:
+            times.append(parse_time(record["timestamp"]))
+        except (TypeError, ValueError):
+            continue
+        message = record.get("message")
+        if record.get("type") == "assistant" and isinstance(message, dict):
+            for block in _blocks(message, "tool_use"):
+                use_id = str(block.get("id") or "")
+                if SESSION_ID.fullmatch(use_id):
+                    calls[use_id] = tool_use(block)
+                    models[message.get("model") or ""] += 1
+        elif record.get("type") == "user":
+            failed.update(str(block.get("tool_use_id")) for block in _blocks(message, "tool_result") if block.get("is_error"))
+    session_id = session_id or path.stem
+    if not calls or not SESSION_ID.fullmatch(session_id):
+        return None
+    model = models.most_common(1)[0][0]
+    return Session(session_id, min(times), max(times), cwd, model if MCP_NAME.fullmatch(model) else "", calls, failed & set(calls))
+
+
+def session_line(session: Session, author: str) -> str:
+    """One note line: the session and each tool call as id:category:server:tool:failed. No inputs."""
+    calls = ",".join(
+        f"{use_id}:{category}:{server or ''}:{mcp_tool or ''}:{int(use_id in session.failed)}"
+        for use_id, (category, server, mcp_tool) in session.calls.items()
+    )
+    model = f" model={session.model}" if session.model else ""
+    return (f"{CLAUDE_TOOL} session={session.session_id}{model} author={author} "
+            f"from={int(session.start)} to={int(session.end)} calls={calls}")
+
+
+def note_sessions(text: str) -> set[str]:
+    return set(re.findall(r"(?:^| )session=(\S+)", text, flags=re.M))
+
+
+def add_session(sha: str, session: Session, author: str) -> None:
+    """Write the session line on the commit. A new copy of the same session replaces the old one."""
+    keep = [line for line in read_note(sha, SESSIONS_REF).splitlines() if session.session_id not in note_sessions(line)]
+    write_note(sha, "\n".join([*keep, session_line(session, author)]) + "\n", SESSIONS_REF)
+
+
+def session_commit(session: Session, commits: list[Commit]) -> Commit | None:
+    """The last commit made before the session ended (newest first), or else the first commit."""
+    return next((commit for commit in commits if commit.author_time <= session.end), commits[-1] if commits else None)
+
+
+def session_end(payload: dict) -> None:
+    """Claude Code SessionEnd hook: write the tool calls of the session on HEAD. Never fails."""
+    cwd, path = payload.get("cwd"), payload.get("transcript_path")
+    if not cwd or not path or not os.path.isdir(cwd):
+        return
+    os.chdir(cwd)
+    if not git_ok("rev-parse", "--verify", "--quiet", "HEAD") or not remote_allowed("origin"):
+        return
+    session = read_session(Path(path))
+    if session and inside(session.cwd or cwd, repo_roots()):
+        add_session("HEAD", session, user_email())
+
+
+def backfill_sessions(email: str, extra_paths: list[str] | None = None, quiet: bool = False) -> int:
+    """Write the sessions of the local transcripts that no note has. Returns the number of sessions written."""
+    roots = repo_roots() + [real(path) for path in extra_paths or []]
+    commits = list_commits("HEAD") if git_ok("rev-parse", "--verify", "--quiet", "HEAD") else []
+    if not commits:
+        return 0
+    done = set()
+    for line in git("notes", f"--ref={SESSIONS_REF}", "list", check=False).splitlines():
+        done |= note_sessions(read_note(line.split()[-1], SESSIONS_REF))
+    written = 0
+    for folder in project_dirs(roots):
+        for path in sorted(folder.glob("*.jsonl")):
+            session = read_session(path)
+            if not session or session.session_id in done or not inside(session.cwd, roots):
+                continue
+            commit = session_commit(session, commits)
+            add_session(commit.sha, session, email)
+            done.add(session.session_id)
+            written += 1
+            if not quiet:
+                print(f"{commit.sha[:10]} session {session.session_id} ({len(session.calls)} tool calls)")
+    return written
+
+
+def claude_settings_path() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "settings.json"
+
+
+def is_session_hook(hook: object) -> bool:
+    command = str(hook.get("command") or "") if isinstance(hook, dict) else ""
+    return "git-ai-usage" in command and "session-end" in command
+
+
+def update_claude_settings(install_hook: bool) -> bool:
+    """Add or remove the SessionEnd hook in the Claude Code settings. The other settings stay."""
+    path = claude_settings_path()
+    try:
+        settings = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, ValueError):
+        settings = None
+    if not isinstance(settings, dict) or not isinstance(settings.get("hooks", {}), dict):
+        print(f"Could not read {path}; the Claude Code SessionEnd hook is not changed.", file=sys.stderr)
+        return False
+    hooks = settings.get("hooks", {})
+    groups = []
+    for group in hooks.get("SessionEnd") or []:
+        if isinstance(group, dict) and isinstance(group.get("hooks"), list):
+            group = {**group, "hooks": [hook for hook in group["hooks"] if not is_session_hook(hook)]}
+            if not group["hooks"]:
+                continue
+        groups.append(group)
+    if install_hook:
+        groups.append({"hooks": [{"type": "command", "command": f"{script_command()} session-end"}]})
+        try:
+            days = int(settings.get("cleanupPeriodDays") or 30)
+        except (TypeError, ValueError):
+            days = 30
+        settings["cleanupPeriodDays"] = max(days, CLAUDE_RETENTION_DAYS)
+    if groups:
+        hooks["SessionEnd"] = groups
+    else:
+        hooks.pop("SessionEnd", None)
+    if hooks:
+        settings["hooks"] = hooks
+    else:
+        settings.pop("hooks", None)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    return True
 
 
 def parse_time(value: str) -> float:
@@ -1218,11 +1488,16 @@ def show(revision: str | None, as_json: bool) -> None:
             print(f"  {tool + ' ' + model:52} {total.cost:>8.2f} $  out={format_tokens(total.tokens['out'])}")
 
 
+def script_command() -> str:
+    script = Path(os.path.realpath(__file__)).as_posix()
+    # Windows has no python3 for the shebang, so the hook names the interpreter.
+    return f"'{Path(sys.executable).as_posix()}' '{script}'" if os.name == "nt" else f"'{script}'"
+
+
 def hook_block(name: str) -> str:
     script = Path(os.path.realpath(__file__)).as_posix()
     args = ' "$1"' if name == "pre-push" else ""
-    # Windows has no python3 for the shebang, so the hook names the interpreter.
-    command = f"'{Path(sys.executable).as_posix()}' '{script}'" if os.name == "nt" else f"'{script}'"
+    command = script_command()
     return (
         f"{HOOK_START}\n"
         f"[ -f '{script}' ] && {command} hook {name}{args} </dev/null >/dev/null 2>&1 || true\n"
@@ -1307,9 +1582,13 @@ def install(global_: bool = False, remotes: list[str] = ()) -> None:
         for name in OUR_HOOKS:
             install_hook(hooks_dir, name)
     # Notes follow commits through amend and rebase, and git log shows them.
-    add_config("notes.rewriteRef", NOTES_REF, scope)
+    for ref in NOTES_REFS:
+        if ref not in git("config", *scope, "--get-all", "notes.rewriteRef", check=False).split():
+            add_config("notes.rewriteRef", ref, scope)
     add_config("notes.displayRef", NOTES_REF, scope)
     print(f"Installed post-commit and pre-push hooks in {hooks_dir}")
+    if update_claude_settings(install_hook=True):
+        print(f"Installed the Claude Code SessionEnd hook in {claude_settings_path()}")
 
 
 def uninstall(global_: bool = False) -> None:
@@ -1329,9 +1608,13 @@ def uninstall(global_: bool = False) -> None:
                     path.unlink()
                 else:
                     write_hook(path, content)
-    for key in ("notes.rewriteRef", "notes.displayRef"):
-        git("config", *scope, "--unset", key, re.escape(NOTES_REF), check=False)
-    print("Removed the hooks. Existing notes stay in refs/notes/ai-usage.")
+    for ref in NOTES_REFS:
+        for key in ("notes.rewriteRef", "notes.displayRef"):
+            git("config", *scope, "--unset-all", key, re.escape(ref), check=False)
+    # The Claude Code hook is one for all repositories, so only the global uninstall removes it.
+    if global_:
+        update_claude_settings(install_hook=False)
+    print(f"Removed the hooks. Existing notes stay in {NOTES_REF} and {SESSIONS_REF}.")
 
 
 def host_path(url: str) -> str:
@@ -1353,19 +1636,22 @@ def remote_allowed(remote: str) -> bool:
 
 def fetch(remote: str) -> None:
     """Merge the remote notes into the local ones, so a push is a fast-forward."""
-    if not git_ok("fetch", "--quiet", remote, f"+{NOTES_REF}:{REMOTE_COPY_REF}"):
-        return
-    if not git_ok("rev-parse", "--verify", "--quiet", NOTES_REF):
-        git("update-ref", NOTES_REF, REMOTE_COPY_REF)
-        return
-    git("notes", f"--ref={NOTES_REF}", "merge", "--quiet", "-s", "cat_sort_uniq", REMOTE_COPY_REF)
+    for ref in NOTES_REFS:
+        copy = REMOTE_COPY_REF if ref == NOTES_REF else f"{ref}-remote"
+        if not git_ok("fetch", "--quiet", remote, f"+{ref}:{copy}"):
+            continue
+        if not git_ok("rev-parse", "--verify", "--quiet", ref):
+            git("update-ref", ref, copy)
+            continue
+        git("notes", f"--ref={ref}", "merge", "--quiet", "-s", "cat_sort_uniq", copy)
 
 
 def push(remote: str) -> None:
-    if not git_ok("rev-parse", "--verify", "--quiet", NOTES_REF):
+    refs = [ref for ref in NOTES_REFS if git_ok("rev-parse", "--verify", "--quiet", ref)]
+    if not refs:
         return
     fetch(remote)
-    git("push", "--quiet", "--no-verify", remote, NOTES_REF)
+    git("push", "--quiet", "--no-verify", remote, *refs)
 
 
 def ask(question: str, default: bool = True) -> bool:
@@ -1384,12 +1670,13 @@ def setup() -> None:
     email = user_email()
     if ask(f"Backfill notes for your past commits ({email}) from the local Claude Code and Codex transcripts?"):
         written = backfill(email)
-        print(f"Wrote {written} note{'' if written == 1 else 's'}.")
+        sessions = backfill_sessions(email)
+        print(f"Wrote {written} note{'' if written == 1 else 's'} and {sessions} session{'' if sessions == 1 else 's'}.")
     remote = "origin" if git_ok("remote", "get-url", "origin") else None
-    if remote and git_ok("rev-parse", "--verify", "--quiet", NOTES_REF):
+    if remote and any(git_ok("rev-parse", "--verify", "--quiet", ref) for ref in NOTES_REFS):
         if ask(f"Push the notes to {remote} now? (later pushes send them automatically)", default=False):
             push(remote)
-            print(f"Pushed {NOTES_REF} to {remote}.")
+            print(f"Pushed {NOTES_REF} and {SESSIONS_REF} to {remote}.")
     print("\nSee the usage of this branch with: git ai-usage show")
 
 
@@ -1415,6 +1702,7 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("push", "fetch"):
         sub = commands.add_parser(name, help=f"{name} {NOTES_REF}")
         sub.add_argument("remote", nargs="?", default="origin")
+    commands.add_parser("session-end", help="Claude Code SessionEnd hook: write the tool calls of the session (JSON on stdin)")
     hook_parser = commands.add_parser("hook", help=argparse.SUPPRESS)
     hook_parser.add_argument("name", choices=("post-commit", "pre-push"))
     hook_parser.add_argument("remote", nargs="?", default="origin")
@@ -1436,6 +1724,12 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:  # noqa: BLE001 - a hook must never block a commit or a push
                 pass
             return 0
+        if args.command == "session-end":
+            try:
+                session_end(json.load(sys.stdin))
+            except Exception:  # noqa: BLE001 - a hook must never block Claude Code
+                pass
+            return 0
         if args.command == "setup":
             setup()
         elif args.command == "install":
@@ -1443,8 +1737,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "uninstall":
             uninstall(args.global_)
         elif args.command == "backfill":
-            written = backfill(args.author or user_email(), force=args.force, extra_paths=args.path)
-            print(f"Wrote {written} note{'' if written == 1 else 's'}.")
+            email = args.author or user_email()
+            written = backfill(email, force=args.force, extra_paths=args.path)
+            sessions = backfill_sessions(email, extra_paths=args.path)
+            print(f"Wrote {written} note{'' if written == 1 else 's'} and {sessions} session{'' if sessions == 1 else 's'}.")
         elif args.command == "show":
             show(args.revision, args.json)
         elif args.command == "push":

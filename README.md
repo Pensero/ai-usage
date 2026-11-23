@@ -38,11 +38,12 @@ by model:
 | Command | What it does |
 | --- | --- |
 | `git ai-usage setup` | `install`, then offers `backfill` and `push` |
-| `git ai-usage install` | Adds the `post-commit` and `pre-push` hooks to this repository. Existing hooks stay. |
-| `git ai-usage backfill` | Writes notes for your past commits that have none (`--force` rewrites them, `--path` adds an earlier path of the clone, `--author` uses another email) |
-| `git ai-usage push` / `fetch` | Sends or gets `refs/notes/ai-usage`, merging the notes of other people |
+| `git ai-usage install` | Adds the `post-commit` and `pre-push` hooks to this repository, and the Claude Code `SessionEnd` hook to `~/.claude/settings.json`. Existing hooks stay. Sets `cleanupPeriodDays` to at least 365. |
+| `git ai-usage backfill` | Writes notes for your past commits that have none, and the sessions of the remaining Claude Code transcripts that no note has (`--force` rewrites them, `--path` adds an earlier path of the clone, `--author` uses another email) |
+| `git ai-usage push` / `fetch` | Sends or gets `refs/notes/ai-usage` and `refs/notes/ai-sessions`, merging the notes of other people |
 | `git ai-usage install --global [--remote TEXT]` | Adds the hooks to all repositories of this user (`core.hooksPath`). The hooks of each repository still run. With `--remote`, only repositories whose push URL starts with `TEXT` (host and path, HTTPS or SSH) get notes. |
-| `git ai-usage uninstall` | Removes the hooks. The notes stay. |
+| `git ai-usage session-end` | The Claude Code `SessionEnd` hook. Reads the hook JSON on stdin and writes the tool calls of the session on `HEAD`. |
+| `git ai-usage uninstall` | Removes the Git hooks of this repository. The notes stay. `--global` also removes the Claude Code hook. |
 | `git ai-usage uninstall --global` | Removes the global install. |
 
 ## Install for a whole organization (MDM)
@@ -119,12 +120,24 @@ Step-by-step instructions for each MDM tool are in the
   the built-in tables. `price_src` on each note line says where its rates came from: `litellm`,
   `models.dev`, `builtin`, or `none` for a model with no price, which costs 0.
 
+- **Sessions.** When a Claude Code session ends, the `SessionEnd` hook writes one line for it in
+  `refs/notes/ai-sessions` on the current `HEAD`, also when the session made no commit. A backfill
+  writes each older session on the last commit before its end. The line has the session ID and
+  each tool call as `tool_use_id:category:mcp_server:mcp_tool:failed`. The categories and the
+  MCP names are the same as in Pensero OTel. No input, command, path or URL is written. A new copy of a session
+  replaces the old one.
+
+  ```
+  claude-code session=0b6c… model=claude-opus-5 author=dev@example.com from=1791000000 to=1791003600 calls=toolu_01:git:::0,toolu_02:ticketing:linear:get_issue:1
+  ```
+
 ## Limits
 
 - Claude Code deletes transcripts after `cleanupPeriodDays` (default 30 days). A backfill cannot
   go back further than the transcripts that remain. To keep more, set a larger value in
   `~/.claude/settings.json`. Codex keeps its rollout files in `$CODEX_HOME` (default `~/.codex`),
   `sessions/` and `archived_sessions/`.
+- Sessions outside a Git repository, and Codex sessions, get no session line.
 - The match is an estimate. When you work on two branches in the same folder at the same time,
   their usage mixes. When you commit from a different email, those commits are not bounds.
 - A squash merge on the server makes a new commit with no note. The pull request commits keep
