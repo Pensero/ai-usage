@@ -918,7 +918,7 @@ class CodexSessionTest(Sandbox):
         self.commit(2)
 
         self.assertEqual(tool.backfill_sessions(EMAIL, quiet=True), 1)
-        self.assertEqual(tool.backfill_sessions(EMAIL, quiet=True), 0)
+        self.assertEqual(tool.backfill_sessions("other@example.com", quiet=True), 0)
 
         [line] = self.sessions_note(first)
         self.assertEqual(

@@ -614,11 +614,13 @@ def backfill_codex_sessions(
     written = 0
     for session in read_codex_sessions(roots, since):
         sha, old = stored.get(session.session_id, ("", ""))
-        line = session_line(session, email)
+        # A stored session keeps its author: `backfill --author` can set a different one.
+        author = next((pair[7:] for pair in old.split() if pair.startswith("author=")), email)
+        line = session_line(session, author)
         if line == old:
             continue
         sha = sha or session_commit(session, commits).sha
-        add_session(sha, session, email)
+        add_session(sha, session, author)
         stored[session.session_id] = (sha, line)
         written += 1
         if not quiet:
