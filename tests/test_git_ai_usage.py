@@ -450,7 +450,7 @@ class CodexTest(Sandbox):
 
     def test_an_old_fork_counts_the_copied_parent_responses_once(self):
         parent = self.rollout("parent")
-        self.commit(1)
+        first = self.commit(1)
         self.legacy_count(parent, T0 + 1100, total=1100, out=100)
         fork = self.rollout("fork", forked_from="parent")
         self.legacy_count(fork, T0 + 1100, total=1100, out=100)  # copied from the parent
@@ -884,3 +884,100 @@ class SessionTest(Sandbox):
         tool.backfill_sessions(EMAIL, quiet=True)
         tool.push("origin")
         self.assertIn(tool.SESSIONS_REF, self.git("ls-remote", str(remote)))
+
+
+class CodexSessionTest(Sandbox):
+    def calls(self, path: Path, when: float, *items):
+        for kind, payload in items:
+            self.codex_line(path, when, kind, payload)
+
+    def sessions_note(self, sha: str) -> list[str]:
+        return tool.read_note(sha, tool.SESSIONS_REF).splitlines()
+
+    def test_backfill_writes_each_call_with_its_category_and_no_arguments_once(self):
+        path = self.rollout("t1")
+        first = self.commit(1)
+        self.calls(
+            path, T0 + 1500,
+            ("response_item", {"type": "function_call", "call_id": "c1", "name": "exec_command",
+                               "arguments": json.dumps({"cmd": "git status && echo SECRET"})}),
+            ("response_item", {"type": "function_call", "call_id": "c2", "name": "get_issue",
+                               "namespace": "mcp__codex_apps__linear", "arguments": "{\"id\": \"SECRET\"}"}),
+            ("event_msg", {"type": "mcp_tool_call_end", "call_id": "c2", "result": {"Err": "SECRET"},
+                           "invocation": {"server": "codex_apps", "tool": "linear_get_issue"}}),
+            ("response_item", {"type": "custom_tool_call", "call_id": "c3", "name": "apply_patch",
+                               "input": "*** Begin Patch SECRET"}),
+            ("response_item", {"type": "web_search_call", "id": "ws1", "action": {"query": "SECRET"}}),
+            ("response_item", {"type": "function_call", "call_id": "c4", "name": "mcp__https://evil.example/x__run"}),
+            ("response_item", {"type": "function_call", "call_id": "c5", "name": "update_plan"}),
+            ("response_item", {"type": "local_shell_call", "call_id": "c6",
+                               "action": {"type": "exec", "command": ["bash", "-lc", "cat README.md"]}}),
+        )
+        with path.open("a") as handle:
+            handle.write('{"timestamp": "half')
+        self.commit(2)
+
+        self.assertEqual(tool.backfill_sessions(EMAIL, quiet=True), 1)
+        self.assertEqual(tool.backfill_sessions("other@example.com", quiet=True), 0)
+
+        [line] = self.sessions_note(first)
+        self.assertEqual(
+            line,
+            f"codex session=t1 model=gpt-5.6-sol author={EMAIL} from={T0} to={T0 + 1500} "
+            "calls=c1:git:::0,c2:ticketing:linear:get_issue:1,c3:file_edit:::0,ws1:web:::0,c4:mcp_other:::0,"
+            "c5:other:::0,c6:read_search:::0",
+        )
+
+    def test_a_fork_writes_only_its_own_calls_and_a_paginated_mcp_failure(self):
+        parent = self.rollout("parent")
+        first = self.commit(1)
+        copied = ("response_item", {"type": "function_call", "call_id": "c1", "name": "exec_command",
+                                    "arguments": json.dumps({"cmd": "ls"})})
+        self.calls(parent, T0 + 1500, copied)
+        fork = self.rollout("fork", forked_from="parent")
+        self.calls(
+            fork, T0 + 1600, copied,
+            ("response_item", {"type": "function_call", "call_id": "c2", "name": "query", "namespace": "mcp__posthog__"}),
+            ("event_msg", {"type": "item_completed", "item": {"type": "McpToolCall", "id": "c2", "server": "posthog",
+                                                                "tool": "query", "status": "failed"}}),
+            ("event_msg", {"type": "item_completed", "item": {"type": "McpToolCall", "id": "c3", "server": "Sentry",
+                                                                "tool": "search", "status": "completed"}}),
+        )
+        sha = self.commit(2)
+
+        tool.backfill_sessions(EMAIL, quiet=True)
+
+        lines = sorted(self.sessions_note(first))
+        self.assertEqual([line.split(" calls=")[1] for line in lines],
+                         ["c2:analytics:posthog:query:1,c3:analytics:sentry:search:0", "c1:read_search:::0"])
+        self.assertEqual(self.sessions_note(sha), [])
+
+    def test_skips_other_folders_auto_review_and_sessions_without_calls(self):
+        call = ("response_item", {"type": "function_call", "call_id": "c1", "name": "exec_command"})
+        other = self.tmp / "other"
+        other.mkdir()
+        self.calls(self.rollout("t1", cwd=other), T0 + 1500, call)
+        self.calls(self.rollout("t2", model="codex-auto-review"), T0 + 1500, call)
+        self.response(self.rollout("t3"), T0 + 1500, "r1", out=10)
+        self.commit(1)
+        self.assertEqual(tool.backfill_sessions(EMAIL, quiet=True), 0)
+
+    def test_pre_push_writes_a_changed_session_once_on_its_first_commit(self):
+        remote = self.tmp / "remote.git"
+        self.git("init", "-q", "--bare", str(remote))
+        self.git("remote", "add", "origin", str(remote))
+        path = self.rollout("t1")
+        first = self.commit(1)
+        self.calls(path, T0 + 1500, ("response_item", {"type": "function_call", "call_id": "c1", "name": "spawn_agent"}))
+        tool.main(["hook", "pre-push", "origin"])
+        self.assertIn(tool.SESSIONS_REF, self.git("ls-remote", str(remote)))
+
+        second = self.commit(2)
+        self.calls(path, T0 + 2500, ("response_item", {"type": "function_call", "call_id": "c2", "name": "list_dir"}))
+        tool.main(["hook", "pre-push", "origin"])
+
+        [line] = self.sessions_note(first)
+        self.assertTrue(line.endswith(f"to={T0 + 2500} calls=c1:subagent:::0,c2:read_search:::0"), line)
+        self.assertEqual(self.sessions_note(second), [])
+        os.utime(path, (T0, T0))
+        self.assertEqual(tool.read_codex_sessions(tool.repo_roots(), since=T0 + 1), [])

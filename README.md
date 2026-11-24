@@ -127,8 +127,14 @@ Step-by-step instructions for each MDM tool are in the
   MCP names are the same as in Pensero OTel. No input, command, path or URL is written. A new copy of a session
   replaces the old one.
 
+  Codex sessions get the same line, with the thread ID as the session ID and the `call_id` of each call.
+  Codex runs a hook only after the user trusts it, so there is no Codex hook: the `pre-push` hook writes the
+  sessions whose rollout file changed after the last push, and the backfill writes all the older ones. A
+  session that continues gets a new copy of its line on the same commit. A fork writes only its own calls.
+
   ```
   claude-code session=0b6c… model=claude-opus-5 author=dev@example.com from=1791000000 to=1791003600 calls=toolu_01:git:::0,toolu_02:ticketing:linear:get_issue:1
+  codex session=019a… model=gpt-5.6-sol author=dev@example.com from=1791000000 to=1791003600 calls=call_01:git:::0,call_02:analytics:posthog:query:1
   ```
 
 ## Limits
@@ -137,7 +143,8 @@ Step-by-step instructions for each MDM tool are in the
   go back further than the transcripts that remain. To keep more, set a larger value in
   `~/.claude/settings.json`. Codex keeps its rollout files in `$CODEX_HOME` (default `~/.codex`),
   `sessions/` and `archived_sessions/`.
-- Sessions outside a Git repository, and Codex sessions, get no session line.
+- Sessions outside a Git repository get no session line. Codex auto-review threads and threads with no
+  tool call get none either.
 - The match is an estimate. When you work on two branches in the same folder at the same time,
   their usage mixes. When you commit from a different email, those commits are not bounds.
 - A squash merge on the server makes a new commit with no note. The pull request commits keep
