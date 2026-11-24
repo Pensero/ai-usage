@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import contextlib
 import functools
 import json
 import os
@@ -41,7 +42,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 NOTES_REF = "refs/notes/ai-usage"
 REMOTE_COPY_REF = "refs/notes/ai-usage-remote"
@@ -49,6 +50,8 @@ SESSIONS_REF = "refs/notes/ai-sessions"
 NOTES_REFS = (NOTES_REF, SESSIONS_REF)
 # Claude Code deletes transcripts after cleanupPeriodDays (30 by default). Keep a year for backfill.
 CLAUDE_RETENTION_DAYS = 365
+# Seconds before the last scan that a rollout file is read again: a file written during the scan is not lost.
+CODEX_SCAN_MARGIN = 60
 SESSION_ID = re.compile(r"[\w\-]{1,100}")
 CLAUDE_TOOL = "claude-code"
 CODEX_TOOL = "codex"
@@ -415,12 +418,70 @@ def tool_use(block: dict) -> tuple[str, str | None, str | None]:
     if name == "Bash":
         return bash_category(str((block.get("input") or {}).get("command") or "")), None, None
     names = mcp_names(name)
-    if names is None:
-        return "other", None, None
-    server, tool = names
+    return ("other", None, None) if names is None else mcp_call(*names)
+
+
+def mcp_call(server: str, tool: str) -> tuple[str, str | None, str | None]:
+    """(category, MCP server, MCP tool) of an MCP call. Names that are not plain are left out."""
     if not MCP_NAME.fullmatch(server):
         return mcp_category(server, tool), None, None
     return mcp_category(server, tool), server, tool if MCP_NAME.fullmatch(tool) else ""
+
+
+# The Codex categories are the same as in Pensero OTel (`otel_collector/session_storage.py`).
+CODEX_APPS = "codex_apps"
+CODEX_AUTO_REVIEW_MODEL = "codex-auto-review"
+CODEX_SHELL_TOOLS = {"exec", "exec_command", "shell", "shell_command", "local_shell", "run"}
+CODEX_TOOL_CATEGORIES = {
+    "apply_patch": "file_edit",
+    "read_file": "read_search",
+    "grep_files": "read_search",
+    "list_dir": "read_search",
+    "view_image": "read_search",
+    "web_search": "web",
+    "followup_task": "subagent",
+    "spawn_agent": "subagent",
+    "write_stdin": "shell",
+    "wait": "shell",
+}
+
+
+def codex_mcp_names(namespace: str, name: str) -> tuple[str, str] | None:
+    """Lowercase server and tool of a Codex MCP call, or None for a builtin tool.
+
+    The namespace is `mcp__<server>__` for a configured server, and `mcp__codex_apps__<app>` for a ChatGPT app.
+    Older Codex versions put the server in the name: `mcp__<server>__<tool>`.
+    """
+    if not namespace.startswith("mcp__"):
+        return mcp_names(name)
+    parts = [part for part in namespace.removeprefix("mcp__").split("__") if part]
+    if parts[:1] == [CODEX_APPS] and len(parts) > 1:
+        parts = parts[1:]
+    return (parts[0] if parts else "").lower(), name.lower()
+
+
+def codex_command(arguments: object) -> str:
+    """Command of a Codex shell call: `cmd` of `exec_command`, or the `command` list of `shell` (`bash -lc <script>`)."""
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            return ""
+    params = _dict(arguments)
+    command = params.get("cmd") or params.get("command") or ""
+    if not isinstance(command, list):
+        return str(command)
+    words = [str(word) for word in command]
+    return words[-1] if len(words) > 2 and words[0].endswith("sh") else " ".join(words)
+
+
+def codex_tool_use(name: str, namespace: str = "", arguments: object = None) -> tuple[str, str | None, str | None]:
+    """(category, MCP server, MCP tool) of one Codex tool call. The arguments are read here and not stored."""
+    if names := codex_mcp_names(namespace, name):
+        return mcp_call(*names)
+    if name in CODEX_SHELL_TOOLS:
+        return bash_category(codex_command(arguments)), None, None
+    return CODEX_TOOL_CATEGORIES.get(name, "other"), None, None
 
 
 
@@ -437,6 +498,7 @@ class Session:
     model: str
     calls: dict  # tool_use_id: (category, MCP server, MCP tool)
     failed: set
+    tool: str = CLAUDE_TOOL
 
 
 def _blocks(message: object, kind: str) -> list[dict]:
@@ -487,7 +549,7 @@ def session_line(session: Session, author: str) -> str:
         for use_id, (category, server, mcp_tool) in session.calls.items()
     )
     model = f" model={session.model}" if session.model else ""
-    return (f"{CLAUDE_TOOL} session={session.session_id}{model} author={author} "
+    return (f"{session.tool} session={session.session_id}{model} author={author} "
             f"from={int(session.start)} to={int(session.end)} calls={calls}")
 
 
@@ -519,16 +581,82 @@ def session_end(payload: dict) -> None:
         add_session("HEAD", session, user_email())
 
 
+def stored_sessions() -> dict[str, tuple[str, str]]:
+    """The commit and the line of each session in refs/notes/ai-sessions. One git process reads all the notes."""
+    pairs = [line.split() for line in git("notes", f"--ref={SESSIONS_REF}", "list", check=False).splitlines()]
+    pairs = [pair for pair in pairs if len(pair) == 2]
+    if not pairs:
+        return {}
+    data = subprocess.run(
+        ["git", "cat-file", "--batch"], input="".join(f"{blob}\n" for blob, _ in pairs).encode(), capture_output=True,
+    ).stdout
+    stored, position = {}, 0
+    for _, sha in pairs:
+        header_end = data.find(b"\n", position)
+        if header_end < 0:
+            break
+        header = data[position:header_end].split()
+        position = header_end + 1
+        if len(header) != 3 or header[1] != b"blob":
+            continue
+        size = int(header[2])
+        for line in data[position : position + size].decode("utf-8", "replace").splitlines():
+            stored.update(dict.fromkeys(note_sessions(line), (sha, line)))
+        position += size + 1
+    return stored
+
+
+def backfill_codex_sessions(
+    email: str, roots: list[str], commits: list[Commit], stored: dict, since: float | None = None, quiet: bool = False,
+) -> int:
+    """Write the Codex sessions of the rollout files changed after `since`. A stored session that has changed is
+    written again on its commit, so a session has one line. Returns the number of sessions written."""
+    written = 0
+    for session in read_codex_sessions(roots, since):
+        sha, old = stored.get(session.session_id, ("", ""))
+        line = session_line(session, email)
+        if line == old:
+            continue
+        sha = sha or session_commit(session, commits).sha
+        add_session(sha, session, email)
+        stored[session.session_id] = (sha, line)
+        written += 1
+        if not quiet:
+            print(f"{sha[:10]} codex session {session.session_id} ({len(session.calls)} tool calls)")
+    return written
+
+
+def codex_scan_stamp() -> Path:
+    return Path(git("rev-parse", "--git-common-dir").rstrip("\n")) / "ai-usage-codex-scan"
+
+
+def sync_codex_sessions() -> None:
+    """pre-push hook: write the Codex sessions whose rollout file changed after the last push.
+
+    Codex runs a SessionEnd hook only after the user trusts it, so the push writes the sessions. The push sends them
+    at the same time in both cases.
+    """
+    if not git_ok("rev-parse", "--verify", "--quiet", "HEAD"):
+        return
+    stamp, started = codex_scan_stamp(), time.time()
+    try:
+        since = float(stamp.read_text()) - CODEX_SCAN_MARGIN
+    except (OSError, ValueError):
+        since = None
+    backfill_codex_sessions(user_email(), repo_roots(), list_commits("HEAD"), stored_sessions(), since, quiet=True)
+    stamp.write_text(f"{started}\n")
+
+
 def backfill_sessions(email: str, extra_paths: list[str] | None = None, quiet: bool = False) -> int:
-    """Write the sessions of the local transcripts that no note has. Returns the number of sessions written."""
+    """Write the sessions of the local Claude Code transcripts that no note has, and the Codex sessions that are
+    new or changed. Returns the number of sessions written."""
     roots = repo_roots() + [real(path) for path in extra_paths or []]
     commits = list_commits("HEAD") if git_ok("rev-parse", "--verify", "--quiet", "HEAD") else []
     if not commits:
         return 0
-    done = set()
-    for line in git("notes", f"--ref={SESSIONS_REF}", "list", check=False).splitlines():
-        done |= note_sessions(read_note(line.split()[-1], SESSIONS_REF))
-    written = 0
+    stored = stored_sessions()
+    done = set(stored)
+    written = backfill_codex_sessions(email, roots, commits, stored, quiet=quiet)
     for folder in project_dirs(roots):
         for path in sorted(folder.glob("*.jsonl")):
             session = read_session(path)
@@ -865,10 +993,16 @@ class _Thread:
     tier: str = ""
     turn_has_records: bool = False
     turn_legacy: list = field(default_factory=list)
+    start: float | None = None
+    end: float | None = None
+    in_repo: bool = False
+    calls: dict = field(default_factory=dict)
+    failed: set = field(default_factory=set)
+    models: Counter = field(default_factory=Counter)
 
 
 class CodexRollouts:
-    """Reads rollout files into calls and edits.
+    """Reads rollout files into calls, edits and sessions.
 
     The parsing follows `otel_collector/codex_report.py` in Pensero/pensero, which matches the Codex
     OTel export. Ids are kept across files, because a fork copies the records of its parent: the
@@ -883,6 +1017,7 @@ class CodexRollouts:
         self.seen: set[str] = set()
         self.calls: list[Call] = []
         self.edits: list[Edit] = []
+        self.sessions: list[Session] = []
 
     def read(self, thread: str) -> None:
         if thread in self.done or thread not in self.files:
@@ -904,6 +1039,12 @@ class CodexRollouts:
                     # An open session has a half-written last line.
                     continue
         self._end_turn(state)
+        if state.calls and state.in_repo and state.start is not None and SESSION_ID.fullmatch(thread):
+            model = state.models.most_common(1)[0][0]
+            self.sessions.append(Session(
+                thread, state.start, max(state.end or state.start, state.start), state.cwd,
+                model if MCP_NAME.fullmatch(model) else "", state.calls, state.failed & set(state.calls), CODEX_TOOL,
+            ))
 
     def _end_turn(self, state: _Thread) -> None:
         """A turn from before `token_usage_record` (or a file resumed by a newer Codex) carries the
@@ -919,6 +1060,9 @@ class CodexRollouts:
         payload = _dict(record.get("payload"))
         kind = record.get("type")
         if kind == "session_meta":
+            # A fork copies the records of its parent: its own start is the time of its session_meta.
+            with contextlib.suppress(KeyError, TypeError, ValueError):
+                state.start = parse_time(record["timestamp"])
             if payload.get("forked_from_id"):
                 parent = str(payload["forked_from_id"])
                 self.read(parent)
@@ -931,12 +1075,66 @@ class CodexRollouts:
             state.model = str(payload.get("model") or state.model)
             return
         when = parse_time(record["timestamp"])
+        state.start = when if state.start is None else state.start
+        state.end = when if state.end is None else max(state.end, when)
         if kind == "token_usage_record":
             state.turn_has_records = True
             if self._first(f"response|{payload.get('response_id') or ''}"):
                 self._response(when, state.cwd, state.model, state.tier, payload.get("usage"))
         elif kind == "event_msg":
             self._event(state, when, payload)
+            self._call_result(state, payload)
+        elif kind == "response_item":
+            self._tool_call(state, payload)
+
+    def _tool_call(self, state: _Thread, payload: dict) -> None:
+        """One tool call of a `response_item`. A call copied by a fork belongs to its parent."""
+        kind = payload.get("type")
+        if kind in ("function_call", "custom_tool_call"):
+            call_id = str(payload.get("call_id") or "")
+            name, namespace = str(payload.get("name") or ""), str(payload.get("namespace") or "")
+            use = codex_tool_use(name, namespace, payload.get("arguments", payload.get("input")))
+        elif kind == "local_shell_call":
+            call_id = str(payload.get("call_id") or payload.get("id") or "")
+            use = codex_tool_use("local_shell", "", _dict(payload.get("action")))
+        elif kind == "web_search_call":
+            call_id, use = str(payload.get("id") or ""), ("web", None, None)
+        else:
+            return
+        self._add_call(state, call_id, use)
+        if kind == "custom_tool_call" and str(payload.get("status")).lower() == "failed":
+            state.failed.add(call_id)
+
+    def _call_result(self, state: _Thread, payload: dict) -> None:
+        """The failure of a call from its end event. An MCP call with no response item is added from it."""
+        kind = payload.get("type")
+        if kind == "mcp_tool_call_end":
+            call_id, invocation, result = str(payload.get("call_id") or ""), _dict(payload.get("invocation")), payload.get("result")
+            failed = "Err" in _dict(result) or bool(_dict(_dict(result).get("Ok")).get("isError"))
+        elif kind == "item_completed":
+            item = _dict(payload.get("item"))
+            call_id, invocation = str(item.get("id") or ""), item if item.get("type") == "McpToolCall" else {}
+            failed = str(item.get("status")).lower() == "failed"
+        elif kind == "patch_apply_end":
+            call_id, invocation, failed = str(payload.get("call_id") or ""), {}, payload.get("success") is False
+        else:
+            return
+        # The response item has the better names: for a ChatGPT app the server here is always `codex_apps`.
+        if invocation.get("server") and call_id not in state.calls:
+            self._add_call(state, call_id, mcp_call(str(invocation["server"]).lower(), str(invocation.get("tool") or "").lower()))
+        if failed and call_id in state.calls:
+            state.failed.add(call_id)
+
+    def _add_call(self, state: _Thread, call_id: str, use: tuple) -> None:
+        # Auto-review (guardian) calls are not user work, as in Pensero OTel.
+        if not SESSION_ID.fullmatch(call_id) or state.model == CODEX_AUTO_REVIEW_MODEL:
+            return
+        if call_id in state.calls:
+            state.calls[call_id] = use
+        elif self._first(f"call|{call_id}"):
+            state.calls[call_id] = use
+            state.models[state.model] += 1
+            state.in_repo = state.in_repo or inside(state.cwd, self.roots)
 
     def _event(self, state: _Thread, when: float, payload: dict) -> None:
         kind = payload.get("type")
@@ -1001,6 +1199,25 @@ def read_rollouts(roots: list[str], since: float | None = None) -> tuple[list[Ca
             continue
         rollouts.read(thread)
     return rollouts.calls, rollouts.edits
+
+
+def read_codex_sessions(roots: list[str], since: float | None = None) -> list[Session]:
+    """The Codex sessions with tool calls in the repository, from rollout files changed after `since`."""
+    files = rollout_files()
+    rollouts = CodexRollouts(roots, files)
+    for thread, path in files.items():
+        try:
+            if since is not None and path.stat().st_mtime < since:
+                continue
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                meta = _dict(json.loads(handle.readline() or "{}").get("payload"))
+        except (OSError, ValueError, AttributeError):
+            continue
+        # ponytail: the first line names the folder of the thread, so the other files are not read. A thread that
+        # changes its folder later is missed.
+        if inside(str(meta.get("cwd") or ""), roots):
+            rollouts.read(thread)
+    return rollouts.sessions
 
 
 def codex_rates(model: str, tier: str) -> tuple | None:
@@ -1720,6 +1937,8 @@ def main(argv: list[str] | None = None) -> int:
                 if args.name == "post-commit":
                     note_head()
                 else:
+                    with contextlib.suppress(Exception):
+                        sync_codex_sessions()
                     push(args.remote)
             except Exception:  # noqa: BLE001 - a hook must never block a commit or a push
                 pass
